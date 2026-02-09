@@ -66,14 +66,30 @@ static resource_view g_vulkan_depth_candidate_dsv = { 0 };
 static resource g_vulkan_depth_candidate_res = { 0 };
 static uint32_t g_vulkan_depth_candidate_w = 0;
 static uint32_t g_vulkan_depth_candidate_h = 0;
+static uint32_t g_vulkan_depth_candidate_samples = 1;
+static format g_vulkan_depth_candidate_format = format::unknown;
+static uint32_t g_vulkan_depth_candidate_score = 0;
+// Prefer depth from passes that render into the current back buffer, but do not require it (many games render into an intermediate color target).
+static std::atomic_bool g_require_vulkan_backbuffer_rt(false);
+static std::atomic_bool g_lock_vulkan_depth(false);
+static uint32_t g_vulkan_depth_last_score = 0;
+
+// Optional resolved depth path for MSAA depth buffers.
+static resource g_vulkan_depth_resolved = { 0 };
+static resource_view g_vulkan_depth_resolved_srv = { 0 };
+static uint32_t g_vulkan_depth_resolved_w = 0;
+static uint32_t g_vulkan_depth_resolved_h = 0;
+static format g_vulkan_depth_resolved_format = format::unknown;
+static std::atomic_bool g_enable_vulkan_msaa_resolve(false);
+static std::atomic_bool g_require_vulkan_backbuffer_match(false);
 
 // Forward decl
 static void ProcessPendingDepth();
-static void try_bind_vulkan_depth(resource_view dsv);
+static void try_bind_vulkan_depth(resource_view dsv, uint32_t score_hint);
 static void bind_vulkan_candidate_if_good();
 
 // Vulkan/DXVK: called whenever application binds render targets + depth (lets us discover the active depth buffer).
-static void on_bind_render_targets_and_depth_stencil(command_list *, uint32_t, const resource_view *, resource_view dsv)
+static void on_bind_render_targets_and_depth_stencil(command_list *, uint32_t count, const resource_view *rtvs, resource_view dsv)
 {
     if (!g_runtime || !g_device)
         return;
@@ -84,16 +100,39 @@ static void on_bind_render_targets_and_depth_stencil(command_list *, uint32_t, c
         log_info("NFSTweakBridge: bind_render_targets_and_depth_stencil (Vulkan)\n");
     if (dsv.handle == 0)
         return;
-    try_bind_vulkan_depth(dsv);
+    // Score higher if render targets include the current back buffer.
+    uint32_t score = 0;
+    const resource back = g_runtime->get_current_back_buffer();
+    const resource_desc back_desc = g_device->get_resource_desc(back);
+    const uint32_t bb_w = back_desc.texture.width;
+    const uint32_t bb_h = back_desc.texture.height;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const resource r = g_device->get_resource_from_view(rtvs[i]);
+        if (r.handle != 0 && r.handle == back.handle)
+        {
+            score = 1000;
+            break;
+        }
+        if (r.handle != 0 && bb_w != 0 && bb_h != 0)
+        {
+            const resource_desc rd = g_device->get_resource_desc(r);
+            if (rd.type == resource_type::texture_2d && rd.texture.width == bb_w && rd.texture.height == bb_h)
+                score = std::max(score, 600u);
+        }
+    }
+    try_bind_vulkan_depth(dsv, score);
 }
 
-static void try_bind_vulkan_depth(resource_view dsv)
+static void try_bind_vulkan_depth(resource_view dsv, uint32_t score_hint)
 {
     if (!g_runtime || !g_device)
         return;
     if (g_device_api != device_api::vulkan)
         return;
     if (!g_enable_vulkan_depth_bind.load())
+        return;
+    if (g_lock_vulkan_depth.load() && g_runtime_depth_resource.handle != 0)
         return;
     if (dsv.handle == 0)
         return;
@@ -107,10 +146,19 @@ static void try_bind_vulkan_depth(resource_view dsv)
     if (res_desc.type != resource_type::texture_2d)
         return;
 
-    g_vulkan_depth_candidate_dsv = dsv;
-    g_vulkan_depth_candidate_res = depth_res;
-    g_vulkan_depth_candidate_w = res_desc.texture.width;
-    g_vulkan_depth_candidate_h = res_desc.texture.height;
+    // Choose the "best" candidate by preferring the highest score (main camera pass), then largest area.
+    const uint64_t area = static_cast<uint64_t>(res_desc.texture.width) * res_desc.texture.height;
+    const uint64_t best_area = static_cast<uint64_t>(g_vulkan_depth_candidate_w) * g_vulkan_depth_candidate_h;
+    if (score_hint > g_vulkan_depth_candidate_score || (score_hint == g_vulkan_depth_candidate_score && area >= best_area))
+    {
+        g_vulkan_depth_candidate_dsv = dsv;
+        g_vulkan_depth_candidate_res = depth_res;
+        g_vulkan_depth_candidate_w = res_desc.texture.width;
+        g_vulkan_depth_candidate_h = res_desc.texture.height;
+        g_vulkan_depth_candidate_samples = res_desc.texture.samples;
+        g_vulkan_depth_candidate_format = g_device->get_resource_view_desc(dsv).format;
+        g_vulkan_depth_candidate_score = score_hint;
+    }
 }
 
 static void bind_vulkan_candidate_if_good()
@@ -146,19 +194,46 @@ static void bind_vulkan_candidate_if_good()
 
     if (bb_w != 0 && bb_h != 0)
     {
-        const uint64_t bb_area = static_cast<uint64_t>(bb_w) * bb_h;
-        const uint64_t cand_area = static_cast<uint64_t>(g_vulkan_depth_candidate_w) * g_vulkan_depth_candidate_h;
-        if (cand_area < (bb_area / 2))
-            return;
+        if (g_require_vulkan_backbuffer_match.load())
+        {
+            // Require exact match to avoid binding UI/partial-res depth buffers (fixes "only upper part shown").
+            if (g_vulkan_depth_candidate_w != bb_w || g_vulkan_depth_candidate_h != bb_h)
+                return;
+        }
     }
 
-    if (g_runtime_depth_srv.handle != 0 && g_runtime_depth_resource.handle == g_vulkan_depth_candidate_res.handle)
+    // Hysteresis: avoid switching to a lower-confidence camera (helps with "wrong camera" flicker).
+    // Only allow switching if the new score is significantly better than the last bound one.
+    if (g_runtime_depth_resource.handle != 0 && g_vulkan_depth_candidate_score + 150 < g_vulkan_depth_last_score)
+        return;
+
+    // If MSAA, prefer resolved depth SRV if available.
+    const bool is_msaa = (g_vulkan_depth_candidate_samples > 1);
+    if (!is_msaa && g_runtime_depth_srv.handle != 0 && g_runtime_depth_resource.handle == g_vulkan_depth_candidate_res.handle)
         return;
 
     if (g_runtime_depth_srv.handle != 0)
     {
         g_device->destroy_resource_view(g_runtime_depth_srv);
         g_runtime_depth_srv = { 0 };
+    }
+
+    if (is_msaa && g_vulkan_depth_resolved_srv.handle != 0 &&
+        g_vulkan_depth_resolved_w == bb_w && g_vulkan_depth_resolved_h == bb_h &&
+        g_vulkan_depth_resolved_format == g_vulkan_depth_candidate_format)
+    {
+        g_runtime->update_texture_bindings("CUSTOMDEPTH", g_vulkan_depth_resolved_srv, g_vulkan_depth_resolved_srv);
+        log_info("NFSTweakBridge: Bound RESOLVED Vulkan depth buffer as CUSTOMDEPTH.\n");
+        g_vulkan_depth_last_score = g_vulkan_depth_candidate_score;
+
+        g_vulkan_depth_candidate_dsv = { 0 };
+        g_vulkan_depth_candidate_res = { 0 };
+        g_vulkan_depth_candidate_w = 0;
+        g_vulkan_depth_candidate_h = 0;
+        g_vulkan_depth_candidate_samples = 1;
+        g_vulkan_depth_candidate_format = format::unknown;
+        g_vulkan_depth_candidate_score = 0;
+        return;
     }
 
     const resource_view_desc dsv_desc = g_device->get_resource_view_desc(g_vulkan_depth_candidate_dsv);
@@ -168,8 +243,8 @@ static void bind_vulkan_candidate_if_good()
     if (!g_device->create_resource_view(g_vulkan_depth_candidate_res, resource_usage::shader_resource, srv_desc, &srv))
     {
         char msg[256] = {};
-        sprintf_s(msg, "NFSTweakBridge: Failed to create SRV for candidate depth (fmt=%u, w=%u, h=%u)\n",
-            (unsigned)dsv_desc.format, g_vulkan_depth_candidate_w, g_vulkan_depth_candidate_h);
+        sprintf_s(msg, "NFSTweakBridge: Failed to create SRV for candidate depth (fmt=%u, w=%u, h=%u, samples=%u)\n",
+            (unsigned)dsv_desc.format, g_vulkan_depth_candidate_w, g_vulkan_depth_candidate_h, g_vulkan_depth_candidate_samples);
         log_info(msg);
         return;
     }
@@ -178,9 +253,19 @@ static void bind_vulkan_candidate_if_good()
     g_runtime_depth_resource = g_vulkan_depth_candidate_res;
     g_runtime->update_texture_bindings("CUSTOMDEPTH", g_runtime_depth_srv, g_runtime_depth_srv);
     log_info("NFSTweakBridge: Bound Vulkan depth buffer as CUSTOMDEPTH.\n");
+    g_vulkan_depth_last_score = g_vulkan_depth_candidate_score;
+
+    // Reset candidate each frame so we don't stick to a stale/mismatched camera depth buffer.
+    g_vulkan_depth_candidate_dsv = { 0 };
+    g_vulkan_depth_candidate_res = { 0 };
+    g_vulkan_depth_candidate_w = 0;
+    g_vulkan_depth_candidate_h = 0;
+    g_vulkan_depth_candidate_samples = 1;
+    g_vulkan_depth_candidate_format = format::unknown;
+    g_vulkan_depth_candidate_score = 0;
 }
 
-static void on_begin_render_pass(command_list *cmd_list, uint32_t, const render_pass_render_target_desc *, const render_pass_depth_stencil_desc *ds)
+static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const render_pass_render_target_desc *rts, const render_pass_depth_stencil_desc *ds)
 {
     if (g_device_api != device_api::vulkan)
         return;
@@ -189,7 +274,96 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t, const render_
         log_info("NFSTweakBridge: begin_render_pass (Vulkan)\n");
     if (ds == nullptr)
         return;
-    try_bind_vulkan_depth(ds->view);
+    // Score higher if this render pass targets the current back buffer.
+    uint32_t score = 0;
+    const resource back = g_runtime ? g_runtime->get_current_back_buffer() : resource{ 0 };
+    const resource_desc back_desc = (g_runtime && back.handle != 0) ? g_device->get_resource_desc(back) : resource_desc{};
+    const uint32_t bb_w = back_desc.texture.width;
+    const uint32_t bb_h = back_desc.texture.height;
+    if (back.handle != 0)
+    {
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const resource r = g_device->get_resource_from_view(rts[i].view);
+            if (r.handle != 0 && r.handle == back.handle)
+            {
+                score = 1000;
+                break;
+            }
+            if (r.handle != 0 && bb_w != 0 && bb_h != 0)
+            {
+                const resource_desc rd = g_device->get_resource_desc(r);
+                if (rd.type == resource_type::texture_2d && rd.texture.width == bb_w && rd.texture.height == bb_h)
+                    score = std::max(score, 600u);
+            }
+        }
+    }
+    try_bind_vulkan_depth(ds->view, score);
+
+    // If the chosen candidate is MSAA, attempt to resolve it to a non-MSAA texture we can sample reliably.
+    if (g_enable_vulkan_msaa_resolve.load() && g_vulkan_depth_candidate_samples > 1 && g_vulkan_depth_candidate_res.handle != 0)
+    {
+        if (!g_device->check_capability(device_caps::resolve_depth_stencil))
+            return;
+
+        // Backbuffer dims already computed above.
+        if (bb_w == 0 || bb_h == 0)
+            return;
+
+        if (g_require_vulkan_backbuffer_match.load() && (g_vulkan_depth_candidate_w != bb_w || g_vulkan_depth_candidate_h != bb_h))
+            return;
+
+        // (Re)create resolve target if needed
+        if (g_vulkan_depth_resolved.handle == 0 || g_vulkan_depth_resolved_w != bb_w || g_vulkan_depth_resolved_h != bb_h || g_vulkan_depth_resolved_format != g_vulkan_depth_candidate_format)
+        {
+            if (g_vulkan_depth_resolved_srv.handle != 0)
+            {
+                g_device->destroy_resource_view(g_vulkan_depth_resolved_srv);
+                g_vulkan_depth_resolved_srv = { 0 };
+            }
+            if (g_vulkan_depth_resolved.handle != 0)
+            {
+                g_device->destroy_resource(g_vulkan_depth_resolved);
+                g_vulkan_depth_resolved = { 0 };
+            }
+
+            resource_desc desc = {};
+            desc.type = resource_type::texture_2d;
+            desc.texture.width = bb_w;
+            desc.texture.height = bb_h;
+            desc.texture.depth_or_layers = 1;
+            desc.texture.levels = 1;
+            desc.texture.format = g_vulkan_depth_candidate_format;
+            desc.texture.samples = 1;
+            desc.usage = resource_usage::resolve_dest | resource_usage::shader_resource;
+
+            if (!g_device->create_resource(desc, nullptr, resource_usage::resolve_dest, &g_vulkan_depth_resolved))
+                return;
+
+            resource_view_desc srv_desc = resource_view_desc(resource_view_type::texture_2d, g_vulkan_depth_candidate_format, 0, 1, 0, 1);
+            if (!g_device->create_resource_view(g_vulkan_depth_resolved, resource_usage::shader_resource, srv_desc, &g_vulkan_depth_resolved_srv))
+            {
+                g_device->destroy_resource(g_vulkan_depth_resolved);
+                g_vulkan_depth_resolved = { 0 };
+                return;
+            }
+
+            g_vulkan_depth_resolved_w = bb_w;
+            g_vulkan_depth_resolved_h = bb_h;
+            g_vulkan_depth_resolved_format = g_vulkan_depth_candidate_format;
+            log_info("NFSTweakBridge: Created resolved depth target.\n");
+        }
+
+        // Insert resolve into command list
+        const resource src = g_vulkan_depth_candidate_res;
+        const resource dst = g_vulkan_depth_resolved;
+
+        // Best-effort transitions (exact prior state may differ across engines).
+        cmd_list->barrier(src, resource_usage::depth_stencil_write, resource_usage::resolve_source);
+        cmd_list->barrier(dst, resource_usage::resolve_dest, resource_usage::resolve_dest);
+        cmd_list->resolve_texture_region(src, 0, nullptr, dst, 0, 0, 0, 0, g_vulkan_depth_candidate_format);
+        cmd_list->barrier(src, resource_usage::resolve_source, resource_usage::depth_stencil_write);
+    }
 }
 
 static bool on_clear_depth_stencil_view(command_list *, resource_view dsv, const float *, const uint8_t *, uint32_t, const rect *)
@@ -199,7 +373,8 @@ static bool on_clear_depth_stencil_view(command_list *, resource_view dsv, const
     static uint32_t s_seen = 0;
     if (s_seen++ < 3)
         log_info("NFSTweakBridge: clear_depth_stencil_view (Vulkan)\n");
-    try_bind_vulkan_depth(dsv);
+    // Low score: without RT context we may capture non-main-camera depth (mirror/reflection/shadow).
+    try_bind_vulkan_depth(dsv, 0);
     return false; // do not block clear
 }
 
@@ -605,6 +780,32 @@ static void on_overlay_ui(effect_runtime *runtime)
         bool vk_bind = g_enable_vulkan_depth_bind.load();
         if (ImGui::Checkbox("Enable Vulkan Depth Bind (CUSTOMDEPTH)", &vk_bind))
             g_enable_vulkan_depth_bind.store(vk_bind);
+
+        bool vk_bb_rt = g_require_vulkan_backbuffer_rt.load();
+        if (ImGui::Checkbox("Vulkan: Require Backbuffer RT Pass", &vk_bb_rt))
+            g_require_vulkan_backbuffer_rt.store(vk_bb_rt);
+
+        bool vk_lock = g_lock_vulkan_depth.load();
+        if (ImGui::Checkbox("Vulkan: Lock Depth Selection", &vk_lock))
+            g_lock_vulkan_depth.store(vk_lock);
+
+        ImGui::Text("Vulkan candidate: %ux%u (samples=%u score=%u)",
+            g_vulkan_depth_candidate_w, g_vulkan_depth_candidate_h, g_vulkan_depth_candidate_samples, g_vulkan_depth_candidate_score);
+        ImGui::Text("Vulkan last score: %u", g_vulkan_depth_last_score);
+        if (g_runtime && g_device)
+        {
+            const resource back = g_runtime->get_current_back_buffer();
+            const resource_desc bd = g_device->get_resource_desc(back);
+            ImGui::Text("Backbuffer: %ux%u", bd.texture.width, bd.texture.height);
+        }
+
+        bool vk_match = g_require_vulkan_backbuffer_match.load();
+        if (ImGui::Checkbox("Vulkan: Require Backbuffer Match", &vk_match))
+            g_require_vulkan_backbuffer_match.store(vk_match);
+
+        bool vk_resolve = g_enable_vulkan_msaa_resolve.load();
+        if (ImGui::Checkbox("Vulkan: Enable MSAA Depth Resolve", &vk_resolve))
+            g_enable_vulkan_msaa_resolve.store(vk_resolve);
     }
 
     if (g_width && g_height)

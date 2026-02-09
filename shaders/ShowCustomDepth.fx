@@ -11,12 +11,9 @@ float4 PS_ShowDepth(float4 pos : SV_Position, float2 uv : TexCoord) : SV_Target
 {
     float d = tex2D(sDepthTex, uv).r;
 
-    // Visualization:
-    // Many engines use reversed-Z or clear depth to 1.0, so show inverted depth by default.
-    d = 1.0 - d;
-    d = saturate(d * 25.0); // scale up near range for visibility
+    // Grayscale inverted depth
+    d = saturate(1.0 - d);
     d = pow(d, 0.7);
-
     return float4(d, d, d, 1.0);
 }
 
