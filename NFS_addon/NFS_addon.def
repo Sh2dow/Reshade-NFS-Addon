@@ -1,0 +1,6 @@
+LIBRARY NFSTweakMenu
+EXPORTS
+    reshade_addon_register
+    reshade_addon_unregister
+    NAME
+    DESCRIPTION
