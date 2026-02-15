@@ -35,6 +35,7 @@ static std::atomic_uint64_t g_last_capture_qpc{0};
 static std::atomic_uint64_t g_predisplay_call_count{0};
 static std::atomic_uint64_t g_predisplay_zero_count{0};
 static std::atomic_uint64_t g_predisplay_request_count{0};
+static std::atomic_uint64_t g_blur_call_request_count{0};
 static std::mutex g_capture_mutex;
 static std::atomic_bool g_enable_capture{false};
 
@@ -234,6 +235,10 @@ static void capture_and_push_depth(IDirect3DDevice9 *dev)
 // The original FEManager_Render function pointer
 void(__thiscall *FEManager_Render_orig)(unsigned int thisptr) = (void(__thiscall *)(unsigned int))FEMANAGER_RENDER_ADDRESS;
 int(__cdecl *PreDisplay_Render_orig)(int a1) = (int(__cdecl *)(int))PREDISPLAY_RENDER_ADDRESS;
+#if GAME_MW
+static int(__cdecl *MW_BlurPass_orig)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t) =
+	(int(__cdecl *)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))0x006D3B80;
+#endif
 
 void __stdcall FEManager_Render_Hook()
 {
@@ -296,6 +301,43 @@ int __cdecl PreDisplay_Render_Hook(int a1)
 	return PreDisplay_Render_orig(a1);
 }
 
+#if GAME_MW
+int __cdecl MW_BlurPass_Hook(
+	uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+	uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8)
+{
+	const int ret = MW_BlurPass_orig(a1, a2, a3, a4, a5, a6, a7, a8);
+
+	// Anchor pre-HUD request only to strong blur variant (0x0E/0x0F).
+	// The medium variant (8/7) tends to align with post-like phases and can contaminate HUD.
+	const bool strong_blur_variant = (a6 == 0x0E && a7 == 0x0F);
+	if (!strong_blur_variant)
+		return ret;
+
+	// Strong blur active: nudge pre-HUD request timing toward early scene phase.
+	__try
+	{
+		try_resolve_exports();
+		if (g_pfnRenderEffectsPreHudNow)
+		{
+			g_pfnRenderEffectsPreHudNow();
+			g_blur_call_request_count.fetch_add(1, std::memory_order_relaxed);
+		}
+		else if (g_pfnRequestPreHudEffects)
+		{
+			g_pfnRequestPreHudEffects();
+			g_blur_call_request_count.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		OutputDebugStringA("NFS_Addon_Bridge: MW_BlurPass_Hook exception suppressed.\n");
+	}
+
+	return ret;
+}
+#endif
+
 // Provide a stub for optional hook symbol when headers declare it but no TU defines it in this build.
 #if defined(HAS_COPS) && !defined(GAME_UC)
 void __stdcall FECareerRecord_AdjustHeatOnEventWin_Hook() {}
@@ -323,6 +365,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 #else
 				injector::MakeCALL(PREDISPLAY_HOOKADDR1, PreDisplay_Render_Hook, true);
 				injector::MakeCALL(PREDISPLAY_HOOKADDR2, PreDisplay_Render_Hook, true);
+#ifdef GAME_MW
+				injector::MakeCALL(0x006DBE8B, MW_BlurPass_Hook, true);
+				injector::MakeCALL(0x006DBEB0, MW_BlurPass_Hook, true);
+#endif
 #endif
 
 #ifdef GAME_MW
