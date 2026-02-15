@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -22,11 +23,18 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 using PFN_NFSTweak_PushDepthSurface = void(__cdecl *)(void *d3d9_surface, unsigned int width, unsigned int height);
 using PFN_NFSTweak_PushDepthBufferR32F = void(__cdecl *)(const void *data, unsigned int width, unsigned int height, unsigned int row_pitch_bytes);
+using PFN_NFSTweak_RequestPreHudEffects = void(__cdecl *)();
+using PFN_NFSTweak_RenderEffectsPreHudNow = void(__cdecl *)();
 
 static PFN_NFSTweak_PushDepthSurface g_pfnPushDepthSurface = nullptr;
 static PFN_NFSTweak_PushDepthBufferR32F g_pfnPushDepthBufferR32F = nullptr;
+static PFN_NFSTweak_RequestPreHudEffects g_pfnRequestPreHudEffects = nullptr;
+static PFN_NFSTweak_RenderEffectsPreHudNow g_pfnRenderEffectsPreHudNow = nullptr;
 
 static std::atomic_uint64_t g_last_capture_qpc{0};
+static std::atomic_uint64_t g_predisplay_call_count{0};
+static std::atomic_uint64_t g_predisplay_zero_count{0};
+static std::atomic_uint64_t g_predisplay_request_count{0};
 static std::mutex g_capture_mutex;
 static std::atomic_bool g_enable_capture{false};
 
@@ -45,7 +53,9 @@ static bool try_resolve_exports()
 	{
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(h, "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(h, "NFSTweak_PushDepthSurface"));
-		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface);
+		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(h, "NFSTweak_RequestPreHudEffects"));
+		g_pfnRenderEffectsPreHudNow = reinterpret_cast<PFN_NFSTweak_RenderEffectsPreHudNow>(GetProcAddress(h, "NFSTweak_RenderEffectsPreHudNow"));
+		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnRenderEffectsPreHudNow);
 	}
 
 	// Scan modules (robust against renamed addon file)
@@ -61,10 +71,16 @@ static bool try_resolve_exports()
 		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_PushDepthSurface");
 		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects");
+		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_RenderEffectsPreHudNow");
+		if (!p)
 			continue;
 
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(modules[i], "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(modules[i], "NFSTweak_PushDepthSurface"));
+		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects"));
+		g_pfnRenderEffectsPreHudNow = reinterpret_cast<PFN_NFSTweak_RenderEffectsPreHudNow>(GetProcAddress(modules[i], "NFSTweak_RenderEffectsPreHudNow"));
 		return true;
 	}
 
@@ -217,6 +233,7 @@ static void capture_and_push_depth(IDirect3DDevice9 *dev)
 
 // The original FEManager_Render function pointer
 void(__thiscall *FEManager_Render_orig)(unsigned int thisptr) = (void(__thiscall *)(unsigned int))FEMANAGER_RENDER_ADDRESS;
+int(__cdecl *PreDisplay_Render_orig)(int a1) = (int(__cdecl *)(int))PREDISPLAY_RENDER_ADDRESS;
 
 void __stdcall FEManager_Render_Hook()
 {
@@ -227,11 +244,56 @@ void __stdcall FEManager_Render_Hook()
 #endif
 
 #if GAME_MW
+	// Always try to resolve exports from the addon at this hook point.
+	// This keeps pre-HUD signaling independent from depth capture path state.
+	try_resolve_exports();
+
+	// Request/execute pre-HUD effects every FE render tick.
+	if (g_pfnRenderEffectsPreHudNow)
+		g_pfnRenderEffectsPreHudNow();
+	else if (g_pfnRequestPreHudEffects)
+		g_pfnRequestPreHudEffects();
+
 	IDirect3DDevice9 *dev = *(IDirect3DDevice9 **)NFS_D3D9_DEVICE_ADDRESS;
 	capture_and_push_depth(dev);
 #endif
 
 	FEManager_Render_orig(thisptr);
+}
+
+int __cdecl PreDisplay_Render_Hook(int a1)
+{
+#if GAME_MW
+	g_predisplay_call_count.fetch_add(1);
+	// Trigger exactly on sub_6E6E40(0), which is the second display-phase call in eDisplayFrame.
+	// This is a stronger pre-HUD boundary than FEManager::Render helper internals.
+	if (a1 == 0)
+	{
+		g_predisplay_zero_count.fetch_add(1);
+		__try
+		{
+			try_resolve_exports();
+			if (g_pfnRenderEffectsPreHudNow)
+			{
+				g_pfnRenderEffectsPreHudNow();
+				g_predisplay_request_count.fetch_add(1);
+			}
+			else if (g_pfnRequestPreHudEffects)
+			{
+				g_pfnRequestPreHudEffects();
+				g_predisplay_request_count.fetch_add(1);
+			}
+
+			// Keep this hook lightweight/stable: avoid depth readback work here.
+			// Vulkan path uses runtime depth binding from the add-on side.
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			OutputDebugStringA("NFS_Addon_Bridge: PreDisplay_Render_Hook exception suppressed.\n");
+		}
+	}
+#endif
+	return PreDisplay_Render_orig(a1);
 }
 
 // Provide a stub for optional hook symbol when headers declare it but no TU defines it in this build.
@@ -259,8 +321,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 				injector::MakeJMP(FEMANAGER_RENDER_HOOKADDR1, ReShade_EntryPoint, true);
 				injector::MakeCALL(MAINSERVICE_HOOK_ADDR, MainService_Hook, true);
 #else
-				injector::MakeCALL(FEMANAGER_RENDER_HOOKADDR1, FEManager_Render_Hook, true);
-				injector::MakeCALL(FEMANAGER_RENDER_HOOKADDR2, FEManager_Render_Hook, true);
+				injector::MakeCALL(PREDISPLAY_HOOKADDR1, PreDisplay_Render_Hook, true);
+				injector::MakeCALL(PREDISPLAY_HOOKADDR2, PreDisplay_Render_Hook, true);
 #endif
 
 #ifdef GAME_MW
@@ -290,7 +352,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 				injector::MakeCALL(HEATONEVENTWIN_HOOK_ADDR, FECareerRecord_AdjustHeatOnEventWin_Hook, true);
 #endif
 #endif
-				OutputDebugStringA("NFS_Addon_Bridge: Hooks installed.\n");
+				OutputDebugStringA("NFS_Addon_Bridge: Hooks installed (eDisplayFrame pre-HUD).\n");
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{

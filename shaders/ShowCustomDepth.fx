@@ -3,9 +3,12 @@
 
 #include "ReShade.fxh"
 
+texture BackBufferTex : COLOR;
+sampler sColor { Texture = BackBufferTex; };
+
 // Bind from addon via runtime->update_texture_bindings("CUSTOMDEPTH", ...).
-texture2D DepthTex : CUSTOMDEPTH;
-sampler2D sDepthTex { Texture = DepthTex; };
+texture CustomDepthTex : CUSTOMDEPTH;
+sampler sDepth { Texture = CustomDepthTex; };
 
 // ---- Haze controls ----
 uniform float HazeStart    = 0.6;   // where haze begins (compressed depth)
@@ -14,38 +17,9 @@ uniform float HazeStrength = 0.35;  // blend amount
 uniform float HazeBias     = 2.0;
 uniform float3 HazeColor   = float3(0.88, 0.8, 0.4);
 
-// Heat map helper
-float3 DepthHeat(float t)
-{
-    return saturate(float3(
-        abs(t * 2.0 - 1.0),        // R → peaks near/far
-        1.0 - abs(t * 2.0 - 1.0),  // G → peaks in the middle
-        1.0 - t                   // B → far
-    ));
-}
-
-float4 PS_DepthHeat_Haze(float4 pos : SV_Position, float2 uv : TexCoord) : SV_Target
-{
-    float d = saturate(tex2D(sDepthTex, uv).r);
-    float dc = 1.0 - pow(1.0 - d, 0.35);
-
-    float3 heat = DepthHeat(dc);
-    float heatContrast = dot(heat, float3(0.25, 0.5, 0.25));
-
-    float3 heatSafe = lerp(dc.xxx, heatContrast.xxx, 0.35);
-
-    // haze
-    float haze = smoothstep(HazeStart, HazeEnd, dc);
-    haze = pow(haze, HazeBias);
-
-    float3 col = lerp(heatSafe, HazeColor, haze * HazeStrength);
-
-    return float4(col, 1.0);
-}
-
 float4 PS_RawDepth_CompressWhite_Haze(float4 pos : SV_Position, float2 uv : TexCoord) : SV_Target
 {
-    float d = tex2D(sDepthTex, uv).r;
+    float d = tex2D(sDepth, uv).r;
 
     // Guard against garbage
     d = saturate(d);
@@ -62,11 +36,32 @@ float4 PS_RawDepth_CompressWhite_Haze(float4 pos : SV_Position, float2 uv : TexC
     return float4(col, 1.0);
 }
 
-technique ShowCustomDepth
+float4 PS_UsableDepth(float2 uv : TEXCOORD) : SV_Target
+{
+    float3 scene = tex2D(sColor, uv).rgb;
+
+    float d = tex2D(sDepth, uv).r;
+
+    // NFS depth is reversed? If near looks white, keep this ON.
+    d = 1.0 - d;
+
+    // Now extract detail from the far range
+    // Far = foggy, Near = clear
+    float fog = smoothstep(0.30, 0.05, d);
+
+    // Shape
+    fog = pow(fog, 1.3);
+
+    scene = lerp(scene, HazeColor, fog * HazeStrength);
+
+    return float4(scene, 1);
+}
+
+technique DebugCustomDepth
 {
     pass
     {
         VertexShader = PostProcessVS;
-        PixelShader  = PS_RawDepth_CompressWhite_Haze;
+        PixelShader  = PS_UsableDepth;
     }
 }

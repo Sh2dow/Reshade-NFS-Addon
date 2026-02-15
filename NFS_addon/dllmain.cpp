@@ -32,6 +32,26 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "NFS depth/texture br
 // ---------- Globals ----------
 std::mutex g_push_mutex;
 static std::atomic_bool g_pending_depth(false);
+static std::atomic_bool g_request_pre_hud_effects(false);
+static std::atomic_bool g_running_manual_effects(false);
+static std::atomic_bool g_pre_hud_effects_issued_this_frame(false);
+static std::atomic_bool g_auto_pre_hud_effects(true);
+static std::atomic_uint32_t g_prehud_request_count(0);
+static std::atomic_uint64_t g_frame_index(0);
+static std::atomic_uint64_t g_request_pre_hud_frame(0);
+static std::atomic_uint64_t g_last_bridge_request_frame(0);
+static std::atomic_uint64_t g_beginpass_counter(0);
+static std::atomic_uint64_t g_clear_counter(0);
+static std::atomic_uint64_t g_render_counter(0);
+static std::atomic_bool g_defer_first_qualifying_pass_after_request(true);
+static std::atomic_bool g_disable_beginpass_after_fault(false);
+static std::atomic_bool g_enable_vulkan_beginpass_prehud(true);
+static std::atomic_int g_skip_manual_prehud_frames(0);
+static resource g_prehud_locked_rt_resource = { 0 };
+static resource g_prehud_locked_ds_resource = { 0 };
+static std::atomic_uint64_t g_prehud_lock_last_hit_frame(0);
+static std::atomic_uint64_t g_prehud_lock_miss_frames(0);
+static std::atomic_bool g_seen_reload_settle(false);
 
 static unsigned int g_last_width = 0, g_last_height = 0;
 
@@ -69,9 +89,9 @@ static uint32_t g_vulkan_depth_candidate_h = 0;
 static uint32_t g_vulkan_depth_candidate_samples = 1;
 static format g_vulkan_depth_candidate_format = format::unknown;
 static uint32_t g_vulkan_depth_candidate_score = 0;
-// Prefer depth from passes that render into the current back buffer, but do not require it (many games render into an intermediate color target).
+// Prefer deterministic scene pass selection, but allow scored fallback on engines that never bind backbuffer here.
 static std::atomic_bool g_require_vulkan_backbuffer_rt(false);
-static std::atomic_bool g_lock_vulkan_depth(false);
+static std::atomic_bool g_lock_vulkan_depth(true);
 static uint32_t g_vulkan_depth_last_score = 0;
 
 // Optional resolved depth path for MSAA depth buffers.
@@ -80,7 +100,7 @@ static resource_view g_vulkan_depth_resolved_srv = { 0 };
 static uint32_t g_vulkan_depth_resolved_w = 0;
 static uint32_t g_vulkan_depth_resolved_h = 0;
 static format g_vulkan_depth_resolved_format = format::unknown;
-static std::atomic_bool g_enable_vulkan_msaa_resolve(false);
+static std::atomic_bool g_enable_vulkan_msaa_resolve(true);
 static std::atomic_bool g_require_vulkan_backbuffer_match(false);
 
 // Forward decl
@@ -88,18 +108,54 @@ static void ProcessPendingDepth();
 static void try_bind_vulkan_depth(resource_view dsv, uint32_t score_hint);
 static void bind_vulkan_candidate_if_good();
 
+extern "C" __declspec(dllexport)
+void NFSTweak_RequestPreHudEffects()
+{
+    const uint64_t frame = g_frame_index.load(std::memory_order_relaxed);
+    g_request_pre_hud_frame.store(frame, std::memory_order_relaxed);
+    g_request_pre_hud_effects.store(true);
+    g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
+}
+
+extern "C" __declspec(dllexport)
+void NFSTweak_RenderEffectsPreHudNow()
+{
+    // Safe deterministic signal from bridge hook (IDA-validated FE boundary).
+    // Actual render happens in the bind callback where command context is valid.
+    const uint64_t frame = g_frame_index.load(std::memory_order_relaxed);
+    g_prehud_request_count.fetch_add(1);
+    g_last_bridge_request_frame.store(frame, std::memory_order_relaxed);
+    g_request_pre_hud_frame.store(frame, std::memory_order_relaxed);
+    g_request_pre_hud_effects.store(true);
+    g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
+}
+
 // Vulkan/DXVK: called whenever application binds render targets + depth (lets us discover the active depth buffer).
-static void on_bind_render_targets_and_depth_stencil(command_list *, uint32_t count, const resource_view *rtvs, resource_view dsv)
+static void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uint32_t count, const resource_view *rtvs, resource_view dsv)
 {
     if (!g_runtime || !g_device)
         return;
+
+    static uint32_t s_bind_debug = 0;
+    if (s_bind_debug++ < 6)
+    {
+        char msg[256] = {};
+        sprintf_s(msg,
+            "NFSTweakBridge: bind RT/DSV callback (cmd=%p, count=%u, rtv0=%llu, dsv=%llu, auto=%d, req=%d, issued=%d)\n",
+            cmd_list, count,
+            (count > 0 && rtvs) ? static_cast<unsigned long long>(rtvs[0].handle) : 0ull,
+            static_cast<unsigned long long>(dsv.handle),
+            g_auto_pre_hud_effects.load() ? 1 : 0,
+            g_request_pre_hud_effects.load() ? 1 : 0,
+            g_pre_hud_effects_issued_this_frame.load() ? 1 : 0);
+        log_info(msg);
+    }
+
     if (g_device_api != device_api::vulkan)
         return;
     static uint32_t s_seen = 0;
     if (s_seen++ < 3)
         log_info("NFSTweakBridge: bind_render_targets_and_depth_stencil (Vulkan)\n");
-    if (dsv.handle == 0)
-        return;
     // Score higher if render targets include the current back buffer.
     uint32_t score = 0;
     const resource back = g_runtime->get_current_back_buffer();
@@ -121,7 +177,28 @@ static void on_bind_render_targets_and_depth_stencil(command_list *, uint32_t co
                 score = std::max(score, 600u);
         }
     }
-    try_bind_vulkan_depth(dsv, score);
+
+    // Pre-HUD path (safe point):
+    // Render on the first pass this frame that has both RT and DSV bound.
+    // This avoids Vulkan begin_render_pass reentrancy issues and usually happens before HUD passes.
+    if (cmd_list != nullptr &&
+        count > 0 && rtvs != nullptr && rtvs[0].handle != 0 &&
+        (g_auto_pre_hud_effects.load() || g_request_pre_hud_effects.load()) &&
+        !g_pre_hud_effects_issued_this_frame.load() &&
+        !g_running_manual_effects.exchange(true))
+    {
+        g_runtime->render_effects(cmd_list, rtvs[0], rtvs[0]);
+        g_running_manual_effects.store(false);
+        g_pre_hud_effects_issued_this_frame.store(true);
+        g_request_pre_hud_effects.store(false);
+        static uint64_t s_bind_render_log_count = 0;
+        const uint64_t c = ++s_bind_render_log_count;
+        if (c <= 3 || (c % 120) == 0)
+            log_info("NFSTweakBridge: Rendered effects at pre-HUD pass (bind RT/DSV).\n");
+    }
+
+    if (dsv.handle != 0)
+        try_bind_vulkan_depth(dsv, score);
 }
 
 static void try_bind_vulkan_depth(resource_view dsv, uint32_t score_hint)
@@ -269,9 +346,9 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
 {
     if (g_device_api != device_api::vulkan)
         return;
-    static uint32_t s_seen = 0;
-    if (s_seen++ < 3)
-        log_info("NFSTweakBridge: begin_render_pass (Vulkan)\n");
+    if (g_runtime == nullptr || g_device == nullptr)
+        return;
+    const uint64_t bp = g_beginpass_counter.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ds == nullptr)
         return;
     // Score higher if this render pass targets the current back buffer.
@@ -298,6 +375,192 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             }
         }
     }
+    // IMPORTANT:
+    // Do NOT call 'render_effects' from inside Vulkan begin_render_pass callback.
+    // That can cause invalid nested render pass / command state and crash.
+
+    // Experimental but deterministic Vulkan pre-HUD path:
+    // On builds where 'bind_render_targets_and_depth_stencil' does not fire, trigger here with strict guards.
+    resource_view prehud_rtv = { 0 };
+    resource prehud_rtv_resource = { 0 };
+    resource prehud_dsv_resource = { 0 };
+    bool lock_miss_this_pass = false;
+    if (ds && ds->view.handle != 0)
+        prehud_dsv_resource = g_device->get_resource_from_view(ds->view);
+    if (count > 0 && rts != nullptr)
+    {
+        // 0) If a pre-HUD RT+DS pair is locked, try to reuse it first (stability against flashing).
+        if (g_prehud_locked_rt_resource.handle != 0 && g_prehud_locked_ds_resource.handle != 0)
+        {
+            bool found_locked_pair = false;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const resource rr = g_device->get_resource_from_view(rts[i].view);
+                if (rr.handle != 0 &&
+                    rr.handle == g_prehud_locked_rt_resource.handle &&
+                    prehud_dsv_resource.handle != 0 &&
+                    prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle)
+                {
+                    prehud_rtv = rts[i].view;
+                    prehud_rtv_resource = rr;
+                    found_locked_pair = true;
+                    break;
+                }
+            }
+            // Lock miss in this pass: keep lock and wait for matching pass later in the frame.
+            if (!found_locked_pair)
+                lock_miss_this_pass = true;
+        }
+
+        // Locked mode: only render on the locked signature.
+        if (lock_miss_this_pass)
+        {
+            return;
+        }
+
+        // Prefer the RT that maps to the current back buffer to avoid pass-to-pass flicker.
+        if (prehud_rtv.handle == 0)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const resource rr = g_device->get_resource_from_view(rts[i].view);
+                if (rr.handle != 0 && rr.handle == back.handle)
+                {
+                    prehud_rtv = rts[i].view;
+                    prehud_rtv_resource = rr;
+                    break;
+                }
+            }
+        }
+        // Fallback: pick the best-scored full-res RT in this pass when explicit backbuffer requirement is disabled.
+        if (prehud_rtv.handle == 0 && !g_require_vulkan_backbuffer_rt.load() && bb_w != 0 && bb_h != 0)
+        {
+            uint32_t best_i = UINT32_MAX;
+            uint32_t best_score = 0;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const resource rr = g_device->get_resource_from_view(rts[i].view);
+                if (rr.handle == 0)
+                    continue;
+                const resource_desc rd = g_device->get_resource_desc(rr);
+                if (rd.type != resource_type::texture_2d)
+                    continue;
+
+                uint32_t local = 0;
+                if (rd.texture.width == bb_w && rd.texture.height == bb_h)
+                    local = 700;
+                else if (rd.texture.width >= (bb_w * 3) / 4 && rd.texture.height >= (bb_h * 3) / 4)
+                    local = 400;
+
+                if (local > best_score)
+                {
+                    best_score = local;
+                    best_i = i;
+                }
+            }
+
+            if (best_i != UINT32_MAX)
+            {
+                prehud_rtv = rts[best_i].view;
+                prehud_rtv_resource = g_device->get_resource_from_view(rts[best_i].view);
+            }
+        }
+    }
+
+    const uint64_t frame = g_frame_index.load(std::memory_order_relaxed);
+    if (g_request_pre_hud_effects.load(std::memory_order_relaxed) &&
+        g_request_pre_hud_frame.load(std::memory_order_relaxed) != frame)
+    {
+        // Drop stale request from prior frame to avoid rendering on wrong early pass.
+        g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
+    }
+    const bool wants_prehud = g_request_pre_hud_effects.load(std::memory_order_relaxed);
+
+    // Request timing from bridge often lands right before the first scene pass candidate.
+    // Defer one qualifying pass so render happens on the subsequent scene pass in the same frame.
+    if (wants_prehud &&
+        prehud_rtv.handle != 0 &&
+        prehud_dsv_resource.handle != 0 &&
+        score >= 600 &&
+        g_defer_first_qualifying_pass_after_request.exchange(false, std::memory_order_relaxed))
+    {
+        try_bind_vulkan_depth(ds->view, score);
+        return;
+    }
+    if (g_enable_vulkan_beginpass_prehud.load() &&
+        !g_disable_beginpass_after_fault.load(std::memory_order_relaxed) &&
+        cmd_list != nullptr &&
+        prehud_rtv.handle != 0 &&
+        prehud_rtv_resource.handle != 0 &&
+        prehud_dsv_resource.handle != 0 &&
+        wants_prehud &&
+        g_skip_manual_prehud_frames.load() <= 0 &&
+        g_runtime->get_effects_state() &&
+        !g_running_manual_effects.exchange(true))
+    {
+        const resource_desc prehud_desc = g_device->get_resource_desc(prehud_rtv_resource);
+        if (prehud_desc.type != resource_type::texture_2d || prehud_desc.texture.samples > 1)
+        {
+            // AA path: avoid rendering on MSAA targets (causes interlacing/artifacts).
+            // Keep request pending for a later resolved single-sample scene pass.
+            g_running_manual_effects.store(false);
+            return;
+        }
+
+        bool render_ok = true;
+        __try
+        {
+            g_runtime->render_effects(cmd_list, prehud_rtv, prehud_rtv);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            render_ok = false;
+            g_disable_beginpass_after_fault.store(true, std::memory_order_relaxed);
+            log_info("NFSTweakBridge: render_effects fault in begin_render_pass; disabling beginpass path.\n");
+        }
+        if (!render_ok)
+        {
+            g_running_manual_effects.store(false);
+            g_request_pre_hud_effects.store(false);
+            return;
+        }
+        const uint64_t rc = g_render_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_running_manual_effects.store(false);
+        g_request_pre_hud_effects.store(false);
+        // Relock only on strong scene-aligned passes to reduce oscillation.
+        const bool strong_scene_pass =
+            (back.handle != 0 && prehud_rtv_resource.handle == back.handle) ||
+            (!g_require_vulkan_backbuffer_rt.load() && score >= 1000);
+        if (strong_scene_pass && prehud_rtv_resource.handle != 0)
+            g_prehud_locked_rt_resource = prehud_rtv_resource;
+        if (strong_scene_pass)
+        {
+            g_prehud_locked_ds_resource = prehud_dsv_resource;
+            g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
+            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+        }
+        else
+        {
+            g_prehud_locked_rt_resource = { 0 };
+            g_prehud_locked_ds_resource = { 0 };
+            g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
+            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+        }
+        if (rc <= 5 || (rc % 120) == 0)
+        {
+            char msg[320] = {};
+            sprintf_s(msg,
+                "NFSTweakBridge: Rendered effects at pre-HUD (rc=%llu frame=%llu bp=%llu rtv=%llu dsv=%llu score=%u)\n",
+                static_cast<unsigned long long>(rc),
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long long>(bp),
+                static_cast<unsigned long long>(prehud_rtv_resource.handle),
+                static_cast<unsigned long long>(prehud_dsv_resource.handle),
+                score);
+            log_info(msg);
+        }
+    }
+
     try_bind_vulkan_depth(ds->view, score);
 
     // If the chosen candidate is MSAA, attempt to resolve it to a non-MSAA texture we can sample reliably.
@@ -370,12 +633,31 @@ static bool on_clear_depth_stencil_view(command_list *, resource_view dsv, const
 {
     if (g_device_api != device_api::vulkan)
         return false;
-    static uint32_t s_seen = 0;
-    if (s_seen++ < 3)
-        log_info("NFSTweakBridge: clear_depth_stencil_view (Vulkan)\n");
+    if (g_runtime == nullptr || g_device == nullptr)
+        return false;
+    g_clear_counter.fetch_add(1, std::memory_order_relaxed);
     // Low score: without RT context we may capture non-main-camera depth (mirror/reflection/shadow).
     try_bind_vulkan_depth(dsv, 0);
     return false; // do not block clear
+}
+
+static void on_reshade_reloaded_effects(effect_runtime *runtime)
+{
+    if (runtime != g_runtime)
+        return;
+    g_disable_beginpass_after_fault.store(false, std::memory_order_relaxed);
+    // Some setups emit this repeatedly; only apply a settle reset once to avoid lock thrash/flicker.
+    if (!g_seen_reload_settle.exchange(true, std::memory_order_relaxed))
+    {
+        g_skip_manual_prehud_frames.store(8);
+        g_running_manual_effects.store(false);
+        g_pre_hud_effects_issued_this_frame.store(false);
+        g_prehud_locked_rt_resource = { 0 };
+        g_prehud_locked_ds_resource = { 0 };
+        g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
+        g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+        log_info("NFSTweakBridge: Effects reloaded, delaying manual pre-HUD pass (initial settle).\n");
+    }
 }
 
 // ---------- Helper: create or resize the ReShade depth resource ----------
@@ -770,16 +1052,25 @@ static void on_overlay_ui(effect_runtime *runtime)
     ImGui::Separator();
 
     ImGui::Text("Depth incoming: %s", g_pending_depth.load() ? "Yes (pending)" : "No");
+    ImGui::Text("PreHUD requests: %u", g_prehud_request_count.load());
 
     bool enabled = g_enable_depth_processing.load();
     if (ImGui::Checkbox("Enable Depth Processing (CPU readback)", &enabled))
         g_enable_depth_processing.store(enabled);
+
+    bool auto_pre_hud = g_auto_pre_hud_effects.load();
+    if (ImGui::Checkbox("Auto Pre-HUD Effects Pass", &auto_pre_hud))
+        g_auto_pre_hud_effects.store(auto_pre_hud);
 
     if (g_device_api == device_api::vulkan)
     {
         bool vk_bind = g_enable_vulkan_depth_bind.load();
         if (ImGui::Checkbox("Enable Vulkan Depth Bind (CUSTOMDEPTH)", &vk_bind))
             g_enable_vulkan_depth_bind.store(vk_bind);
+
+        bool vk_bp = g_enable_vulkan_beginpass_prehud.load();
+        if (ImGui::Checkbox("Vulkan: BeginPass Pre-HUD (Experimental)", &vk_bp))
+            g_enable_vulkan_beginpass_prehud.store(vk_bp);
 
         bool vk_bb_rt = g_require_vulkan_backbuffer_rt.load();
         if (ImGui::Checkbox("Vulkan: Require Backbuffer RT Pass", &vk_bb_rt))
@@ -792,6 +1083,7 @@ static void on_overlay_ui(effect_runtime *runtime)
         ImGui::Text("Vulkan candidate: %ux%u (samples=%u score=%u)",
             g_vulkan_depth_candidate_w, g_vulkan_depth_candidate_h, g_vulkan_depth_candidate_samples, g_vulkan_depth_candidate_score);
         ImGui::Text("Vulkan last score: %u", g_vulkan_depth_last_score);
+        ImGui::Text("PreHUD skip frames after reload: %d", g_skip_manual_prehud_frames.load());
         if (g_runtime && g_device)
         {
             const resource back = g_runtime->get_current_back_buffer();
@@ -806,6 +1098,8 @@ static void on_overlay_ui(effect_runtime *runtime)
         bool vk_resolve = g_enable_vulkan_msaa_resolve.load();
         if (ImGui::Checkbox("Vulkan: Enable MSAA Depth Resolve", &vk_resolve))
             g_enable_vulkan_msaa_resolve.store(vk_resolve);
+
+        ImGui::TextUnformatted("Pre-HUD pass runs from RT/DSV bind callback (Vulkan-safe path).");
     }
 
     if (g_width && g_height)
@@ -823,6 +1117,8 @@ static void on_init_effect_runtime(effect_runtime *runtime)
     g_runtime = runtime;
     g_device = runtime->get_device();
     g_device_api = g_device ? g_device->get_api() : device_api::d3d9;
+    g_seen_reload_settle.store(false, std::memory_order_relaxed);
+    g_disable_beginpass_after_fault.store(false, std::memory_order_relaxed);
     log_info("NFSTweakBridge: init_effect_runtime\n");
 
     // Vulkan/DXVK: Do not create any placeholder resources here (this has been observed to hang on some setups).
@@ -830,6 +1126,7 @@ static void on_init_effect_runtime(effect_runtime *runtime)
     if (g_device_api == device_api::vulkan)
     {
         g_enabled_for_runtime = true;
+        g_auto_pre_hud_effects.store(true);
         log_info("NFSTweakBridge: Vulkan runtime detected (DXVK). Using Vulkan bind hook.\n");
         return;
     }
@@ -876,17 +1173,47 @@ static void on_destroy_effect_runtime(effect_runtime *runtime)
     g_runtime = nullptr;
     g_device = nullptr;
     g_device_api = device_api::d3d9;
+    g_seen_reload_settle.store(false, std::memory_order_relaxed);
+    g_disable_beginpass_after_fault.store(false, std::memory_order_relaxed);
+    g_prehud_locked_rt_resource = { 0 };
+    g_prehud_locked_ds_resource = { 0 };
+    g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
+    g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
 }
 
 // Present hook: run ProcessPendingDepth early in frame so ReShade effects can use it
 static void on_present(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*)
 {
+    const uint64_t frame = g_frame_index.fetch_add(1, std::memory_order_relaxed) + 1;
+    // New frame: allow one manual pre-HUD effect pass again.
+    g_pre_hud_effects_issued_this_frame.store(false);
+    if (g_skip_manual_prehud_frames.load() > 0)
+        g_skip_manual_prehud_frames.fetch_sub(1);
+
     if (!g_enabled_for_runtime)
         return;
 
     // Vulkan path: choose/bind once per frame (reduces flicker and avoids partial binds).
     if (g_device_api == device_api::vulkan)
     {
+        // Unlock stale pre-HUD signature only after sustained full-frame misses.
+        if (g_prehud_locked_rt_resource.handle != 0 && g_prehud_locked_ds_resource.handle != 0)
+        {
+            const uint64_t last_hit = g_prehud_lock_last_hit_frame.load(std::memory_order_relaxed);
+            if (last_hit != 0 && frame > last_hit)
+            {
+                const uint64_t miss = frame - last_hit;
+                g_prehud_lock_miss_frames.store(miss, std::memory_order_relaxed);
+                if (miss > 90)
+                {
+                    g_prehud_locked_rt_resource = { 0 };
+                    g_prehud_locked_ds_resource = { 0 };
+                    g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
+                    g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+                    log_info("NFSTweakBridge: Released stale pre-HUD lock after frame misses.\n");
+                }
+            }
+        }
         bind_vulkan_candidate_if_good();
         return;
     }
@@ -917,6 +1244,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
         reshade::register_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
         reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(on_clear_depth_stencil_view);
+        reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reshade_reloaded_effects);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -927,6 +1255,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
         reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
         reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(on_clear_depth_stencil_view);
+        reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(on_reshade_reloaded_effects);
         reshade::unregister_addon(hModule);
     }
     return TRUE;
