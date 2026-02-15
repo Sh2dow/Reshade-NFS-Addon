@@ -6,7 +6,7 @@
 
 #if defined(IMGUI_VERSION_NUM)
 
-#if IMGUI_VERSION_NUM != 19250
+#if IMGUI_VERSION_NUM != 19250 && IMGUI_VERSION_NUM != 19259
 #error Unexpected ImGui version, please update the "imgui.h" header to version 19250!
 #endif
 

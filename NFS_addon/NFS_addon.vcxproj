@@ -92,10 +92,6 @@
     
     <ItemGroup>
         <ClCompile Include="dllmain.cpp"/>
-        <ClCompile Include="..\..\reshade\deps\imgui\imgui.cpp" />
-        <ClCompile Include="..\..\reshade\deps\imgui\imgui_draw.cpp" />
-        <ClCompile Include="..\..\reshade\deps\imgui\imgui_tables.cpp" />
-        <ClCompile Include="..\..\reshade\deps\imgui\imgui_widgets.cpp" />
     </ItemGroup>
     <ItemGroup>
         <ClInclude Include="..\includes\NFSC_PreFEngHook.h"/>
