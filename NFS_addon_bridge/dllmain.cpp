@@ -25,11 +25,13 @@ using PFN_NFSTweak_PushDepthSurface = void(__cdecl *)(void *d3d9_surface, unsign
 using PFN_NFSTweak_PushDepthBufferR32F = void(__cdecl *)(const void *data, unsigned int width, unsigned int height, unsigned int row_pitch_bytes);
 using PFN_NFSTweak_RequestPreHudEffects = void(__cdecl *)();
 using PFN_NFSTweak_RenderEffectsPreHudNow = void(__cdecl *)();
+using PFN_NFSTweak_NotifyPrecipitationChanged = void(__cdecl *)(unsigned int value);
 
 static PFN_NFSTweak_PushDepthSurface g_pfnPushDepthSurface = nullptr;
 static PFN_NFSTweak_PushDepthBufferR32F g_pfnPushDepthBufferR32F = nullptr;
 static PFN_NFSTweak_RequestPreHudEffects g_pfnRequestPreHudEffects = nullptr;
 static PFN_NFSTweak_RenderEffectsPreHudNow g_pfnRenderEffectsPreHudNow = nullptr;
+static PFN_NFSTweak_NotifyPrecipitationChanged g_pfnNotifyPrecipitationChanged = nullptr;
 
 static std::atomic_uint64_t g_last_capture_qpc{0};
 static std::atomic_uint64_t g_predisplay_call_count{0};
@@ -38,6 +40,11 @@ static std::atomic_uint64_t g_predisplay_request_count{0};
 static std::atomic_uint64_t g_blur_call_request_count{0};
 static std::mutex g_capture_mutex;
 static std::atomic_bool g_enable_capture{false};
+static std::atomic_bool g_mw_rain_tick_seen{false};
+static std::atomic_bool g_mw_rain_state_initialized{false};
+static std::atomic_bool g_mw_rain_state_last{false};
+static std::atomic_bool g_mw_precip_debug_initialized{false};
+static std::atomic_uint32_t g_mw_precip_debug_last{0};
 
 static IDirect3DSurface9 *g_sysmem_surface = nullptr;
 static D3DFORMAT g_sysmem_format = D3DFMT_UNKNOWN;
@@ -56,7 +63,8 @@ static bool try_resolve_exports()
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(h, "NFSTweak_PushDepthSurface"));
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(h, "NFSTweak_RequestPreHudEffects"));
 		g_pfnRenderEffectsPreHudNow = reinterpret_cast<PFN_NFSTweak_RenderEffectsPreHudNow>(GetProcAddress(h, "NFSTweak_RenderEffectsPreHudNow"));
-		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnRenderEffectsPreHudNow);
+		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(h, "NFSTweak_NotifyPrecipitationChanged"));
+		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnRenderEffectsPreHudNow || g_pfnNotifyPrecipitationChanged);
 	}
 
 	// Scan modules (robust against renamed addon file)
@@ -76,12 +84,15 @@ static bool try_resolve_exports()
 		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_RenderEffectsPreHudNow");
 		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged");
+		if (!p)
 			continue;
 
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(modules[i], "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(modules[i], "NFSTweak_PushDepthSurface"));
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects"));
 		g_pfnRenderEffectsPreHudNow = reinterpret_cast<PFN_NFSTweak_RenderEffectsPreHudNow>(GetProcAddress(modules[i], "NFSTweak_RenderEffectsPreHudNow"));
+		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged"));
 		return true;
 	}
 
@@ -232,6 +243,86 @@ static void capture_and_push_depth(IDirect3DDevice9 *dev)
 	}
 }
 
+static void pump_precipitation_signal_from_hooks()
+{
+#if GAME_MW
+	if (!try_resolve_exports() || g_pfnNotifyPrecipitationChanged == nullptr)
+		return;
+
+	// Primary edge source: precipitation debug flag sampled in bridge hook context.
+	// This keeps memory reads out of addon and preserves explicit bridge->addon signaling.
+	uint32_t cur_debug = 0;
+	__try
+	{
+		cur_debug = *reinterpret_cast<volatile uint32_t *>(PRECIPITATION_DEBUG_ADDR);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		cur_debug = g_mw_precip_debug_last.load(std::memory_order_relaxed);
+	}
+	if (!g_mw_precip_debug_initialized.load(std::memory_order_relaxed))
+	{
+		g_mw_precip_debug_initialized.store(true, std::memory_order_relaxed);
+		g_mw_precip_debug_last.store(cur_debug, std::memory_order_relaxed);
+	}
+	else
+	{
+		const uint32_t prev_debug = g_mw_precip_debug_last.load(std::memory_order_relaxed);
+		if (cur_debug != prev_debug)
+		{
+			g_mw_precip_debug_last.store(cur_debug, std::memory_order_relaxed);
+			const bool active = (cur_debug != 0);
+			g_mw_rain_state_initialized.store(true, std::memory_order_relaxed);
+			g_mw_rain_state_last.store(active, std::memory_order_relaxed);
+			g_pfnNotifyPrecipitationChanged(active ? 1u : 0u);
+			return;
+		}
+	}
+
+	const bool active_this_frame = g_mw_rain_tick_seen.exchange(false, std::memory_order_relaxed);
+	const bool initialized = g_mw_rain_state_initialized.load(std::memory_order_relaxed);
+	const bool last = g_mw_rain_state_last.load(std::memory_order_relaxed);
+	// Fallback only: if rain tick stopped arriving entirely, emit "off" once.
+	if (initialized && last && !active_this_frame)
+	{
+		g_mw_rain_state_last.store(false, std::memory_order_relaxed);
+		g_pfnNotifyPrecipitationChanged(0u);
+	}
+#endif
+}
+
+#if GAME_MW
+static void(__thiscall *MW_RainTick_orig)(void *self) =
+	reinterpret_cast<void(__thiscall *)(void *)>(0x00758100);
+
+void __fastcall MW_RainTick_Hook(void *self, void *)
+{
+	MW_RainTick_orig(self);
+	g_mw_rain_tick_seen.store(true, std::memory_order_relaxed);
+
+	uint32_t render_flag = 0;
+	__try
+	{
+		render_flag = *reinterpret_cast<volatile uint32_t *>(PRECIPITATION_RENDER_ADDR);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return;
+	}
+
+	const bool active = (render_flag != 0);
+	const bool initialized = g_mw_rain_state_initialized.load(std::memory_order_relaxed);
+	const bool last = g_mw_rain_state_last.load(std::memory_order_relaxed);
+	if (!initialized || active != last)
+	{
+		g_mw_rain_state_initialized.store(true, std::memory_order_relaxed);
+		g_mw_rain_state_last.store(active, std::memory_order_relaxed);
+		if (try_resolve_exports() && g_pfnNotifyPrecipitationChanged != nullptr)
+			g_pfnNotifyPrecipitationChanged(active ? 1u : 0u);
+	}
+}
+#endif
+
 // The original FEManager_Render function pointer
 void(__thiscall *FEManager_Render_orig)(unsigned int thisptr) = (void(__thiscall *)(unsigned int))FEMANAGER_RENDER_ADDRESS;
 int(__cdecl *PreDisplay_Render_orig)(int a1) = (int(__cdecl *)(int))PREDISPLAY_RENDER_ADDRESS;
@@ -278,6 +369,7 @@ int __cdecl PreDisplay_Render_Hook(int a1)
 		__try
 		{
 			try_resolve_exports();
+			pump_precipitation_signal_from_hooks();
 			if (g_pfnRenderEffectsPreHudNow)
 			{
 				g_pfnRenderEffectsPreHudNow();
@@ -368,6 +460,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 #ifdef GAME_MW
 				injector::MakeCALL(0x006DBE8B, MW_BlurPass_Hook, true);
 				injector::MakeCALL(0x006DBEB0, MW_BlurPass_Hook, true);
+				// Hook rain tick callsite in sub_6DE300 to get event-driven precipitation state edges.
+				injector::MakeCALL(0x006DF545, MW_RainTick_Hook, true);
 #endif
 #endif
 

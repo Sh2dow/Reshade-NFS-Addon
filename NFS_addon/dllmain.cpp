@@ -26,6 +26,7 @@ static void log_info(const char *msg)
     OutputDebugStringA(msg);
 }
 
+
 // exported metadata
 extern "C" __declspec(dllexport) const char* NAME = "NFSTweakBridge";
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "NFS depth/texture bridge + UI";
@@ -66,6 +67,12 @@ static resource g_prehud_locked_rt_resource = { 0 };
 static resource g_prehud_locked_ds_resource = { 0 };
 static std::atomic_uint64_t g_prehud_lock_last_hit_frame(0);
 static std::atomic_uint64_t g_prehud_lock_miss_frames(0);
+static std::atomic_uint32_t g_last_prehud_reject_mask(0);
+// Safety fallback only: primary re-acquire trigger is bridge precipitation edge signal.
+static constexpr uint64_t k_prehud_lock_reacquire_miss_threshold = 60000;
+static std::atomic_bool g_verbose_prehud_debug(false);
+static std::atomic_bool g_precip_signal_pending(false);
+static std::atomic_uint32_t g_precip_signal_value(0);
 static std::atomic_bool g_seen_reload_settle(false);
 static std::atomic_uint64_t g_manual_render_ready_frame(0);
 static std::atomic_uint64_t g_last_reload_event_frame(0);
@@ -133,6 +140,15 @@ static void try_bind_vulkan_depth(resource_view dsv, uint32_t score_hint);
 static void bind_vulkan_candidate_if_good();
 static void reset_prehud_transition(const char *reason, int settle_frames)
 {
+    if (g_prehud_locked_rt_resource.handle != 0 || g_prehud_locked_ds_resource.handle != 0)
+    {
+        char msg[256] = {};
+        sprintf_s(msg,
+            "NFSTweakBridge: Unlocking pre-HUD RT/DS due to transition reset (rtv=%llu dsv=%llu).\n",
+            static_cast<unsigned long long>(g_prehud_locked_rt_resource.handle),
+            static_cast<unsigned long long>(g_prehud_locked_ds_resource.handle));
+        log_info(msg);
+    }
     g_transition_settle_frames.store(settle_frames, std::memory_order_relaxed);
     g_prehud_runtime_state.store(static_cast<int>(prehud_runtime_state::stabilizing), std::memory_order_relaxed);
     g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), 8));
@@ -149,6 +165,7 @@ static void reset_prehud_transition(const char *reason, int settle_frames)
     g_prehud_locked_ds_resource = { 0 };
     g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
     g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+    g_last_prehud_reject_mask.store(0, std::memory_order_relaxed);
     g_last_scene_rt_signature = { 0 };
     g_last_scene_ds_signature = { 0 };
     g_scene_signature_streak = 0;
@@ -219,6 +236,16 @@ void NFSTweak_RenderEffectsPreHudNow()
     g_request_pre_hud_beginpass.store(bp_now, std::memory_order_relaxed);
     g_request_pre_hud_effects.store(true);
     g_defer_first_qualifying_pass_after_request.store(false, std::memory_order_relaxed);
+}
+
+extern "C" __declspec(dllexport)
+void NFSTweak_NotifyPrecipitationChanged(unsigned int value)
+{
+    if (!g_runtime_alive.load(std::memory_order_relaxed))
+        return;
+
+    g_precip_signal_value.store(value, std::memory_order_relaxed);
+    g_precip_signal_pending.store(true, std::memory_order_relaxed);
 }
 
 // Vulkan/DXVK: called whenever application binds render targets + depth (lets us discover the active depth buffer).
@@ -486,13 +513,49 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
                     prehud_rtv = rts[i].view;
                     prehud_rtv_resource = rr;
                     found_locked_pair = true;
+                    g_prehud_lock_last_hit_frame.store(g_frame_index.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                    g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
                     break;
                 }
             }
 
             // Lock miss in this pass: keep lock and wait for matching pass later in the frame.
             if (!found_locked_pair)
+            {
                 lock_miss_this_pass = true;
+                const uint64_t misses = g_prehud_lock_miss_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (g_verbose_prehud_debug.load(std::memory_order_relaxed) &&
+                    (misses <= 3 || (misses % 2400) == 0))
+                {
+                    char msg[320] = {};
+                    sprintf_s(msg,
+                        "NFSTweakBridge: Locked pre-HUD pair miss (misses=%llu frame=%llu bp=%llu locked_rtv=%llu locked_dsv=%llu pass_dsv=%llu).\n",
+                        static_cast<unsigned long long>(misses),
+                        static_cast<unsigned long long>(g_frame_index.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(bp),
+                        static_cast<unsigned long long>(g_prehud_locked_rt_resource.handle),
+                        static_cast<unsigned long long>(g_prehud_locked_ds_resource.handle),
+                        static_cast<unsigned long long>(prehud_dsv_resource.handle));
+                    log_info(msg);
+                }
+                if (misses > k_prehud_lock_reacquire_miss_threshold)
+                {
+                    char reset_msg[320] = {};
+                    sprintf_s(reset_msg,
+                        "NFSTweakBridge: Pre-HUD lock stale (misses=%llu), unlocking for re-acquire (rtv=%llu dsv=%llu).\n",
+                        static_cast<unsigned long long>(misses),
+                        static_cast<unsigned long long>(g_prehud_locked_rt_resource.handle),
+                        static_cast<unsigned long long>(g_prehud_locked_ds_resource.handle));
+                    log_info(reset_msg);
+                    g_prehud_locked_rt_resource = { 0 };
+                    g_prehud_locked_ds_resource = { 0 };
+                    g_active_scene_ds_signature = { 0 };
+                    g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+                    g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), 8), std::memory_order_relaxed);
+                    g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
+                    g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
+                }
+            }
         }
 
         // Locked mode: only render on the locked signature.
@@ -626,11 +689,73 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
     const bool render_cooldown_ok = (last_render_bp == 0) || (bp > last_render_bp && (bp - last_render_bp) >= 10);
     const uint64_t last_manual_frame = g_last_manual_prehud_frame.load(std::memory_order_relaxed);
     const bool not_rendered_this_frame = (last_manual_frame != frame);
+    const prehud_runtime_state runtime_state = static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed));
+
+    enum : uint32_t
+    {
+        kRejectDisabledBeginpass = 1u << 0,
+        kRejectDisabledManual = 1u << 1,
+        kRejectFaultDisabled = 1u << 2,
+        kRejectStateNotActive = 1u << 3,
+        kRejectNotReadyFrame = 1u << 4,
+        kRejectNullCmd = 1u << 5,
+        kRejectNoRTV = 1u << 6,
+        kRejectNoRTRes = 1u << 7,
+        kRejectNoDSRes = 1u << 8,
+        kRejectNoRequest = 1u << 9,
+        kRejectWrongRequestFrame = 1u << 10,
+        kRejectRequestWindow = 1u << 11,
+        kRejectEarlyPhase = 1u << 12,
+        kRejectCooldown = 1u << 13,
+        kRejectAlreadyThisFrame = 1u << 14,
+        kRejectAlreadyIssued = 1u << 15,
+        kRejectSkipFrames = 1u << 16,
+        kRejectBusy = 1u << 17,
+    };
+    uint32_t reject_mask = 0;
+    if (!g_enable_vulkan_beginpass_prehud.load()) reject_mask |= kRejectDisabledBeginpass;
+    if (!g_enable_manual_prehud_render.load(std::memory_order_relaxed)) reject_mask |= kRejectDisabledManual;
+    if (g_disable_beginpass_after_fault.load(std::memory_order_relaxed)) reject_mask |= kRejectFaultDisabled;
+    if (runtime_state != prehud_runtime_state::active) reject_mask |= kRejectStateNotActive;
+    if (frame < g_manual_render_ready_frame.load(std::memory_order_relaxed)) reject_mask |= kRejectNotReadyFrame;
+    if (cmd_list == nullptr) reject_mask |= kRejectNullCmd;
+    if (prehud_rtv.handle == 0) reject_mask |= kRejectNoRTV;
+    if (prehud_rtv_resource.handle == 0) reject_mask |= kRejectNoRTRes;
+    if (prehud_dsv_resource.handle == 0) reject_mask |= kRejectNoDSRes;
+    if (!wants_prehud) reject_mask |= kRejectNoRequest;
+    if (g_request_pre_hud_frame.load(std::memory_order_relaxed) != frame) reject_mask |= kRejectWrongRequestFrame;
+    if (!request_in_tight_window) reject_mask |= kRejectRequestWindow;
+    if (!in_early_frame_phase) reject_mask |= kRejectEarlyPhase;
+    if (!render_cooldown_ok) reject_mask |= kRejectCooldown;
+    if (!not_rendered_this_frame) reject_mask |= kRejectAlreadyThisFrame;
+    if (g_pre_hud_effects_issued_this_frame.load(std::memory_order_relaxed)) reject_mask |= kRejectAlreadyIssued;
+    if (g_skip_manual_prehud_frames.load() > 0) reject_mask |= kRejectSkipFrames;
+    if (g_running_manual_effects.load(std::memory_order_relaxed)) reject_mask |= kRejectBusy;
+
+    if (g_verbose_prehud_debug.load(std::memory_order_relaxed) && wants_prehud && reject_mask != 0)
+    {
+        const uint32_t prev_reject = g_last_prehud_reject_mask.exchange(reject_mask, std::memory_order_relaxed);
+        if (prev_reject != reject_mask)
+        {
+            char msg[512] = {};
+            sprintf_s(msg,
+                "NFSTweakBridge: pre-HUD request rejected (mask=0x%08X frame=%llu bp=%llu req_frame=%llu req_bp=%llu rtv=%llu dsv=%llu score=%u)\n",
+                reject_mask,
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long long>(bp),
+                static_cast<unsigned long long>(g_request_pre_hud_frame.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_request_pre_hud_beginpass.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(prehud_rtv_resource.handle),
+                static_cast<unsigned long long>(prehud_dsv_resource.handle),
+                score);
+            log_info(msg);
+        }
+    }
 
     if (g_enable_vulkan_beginpass_prehud.load() &&
         g_enable_manual_prehud_render.load(std::memory_order_relaxed) &&
         !g_disable_beginpass_after_fault.load(std::memory_order_relaxed) &&
-        static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed)) == prehud_runtime_state::active &&
+        runtime_state == prehud_runtime_state::active &&
         frame >= g_manual_render_ready_frame.load(std::memory_order_relaxed) &&
         cmd_list != nullptr &&
         prehud_rtv.handle != 0 &&
@@ -646,6 +771,21 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         g_skip_manual_prehud_frames.load() <= 0 &&
         !g_running_manual_effects.exchange(true))
     {
+        g_last_prehud_reject_mask.store(0, std::memory_order_relaxed);
+        if (g_verbose_prehud_debug.load(std::memory_order_relaxed) &&
+            ((g_render_counter.load(std::memory_order_relaxed) < 3) || ((g_render_counter.load(std::memory_order_relaxed) % 1200) == 0)))
+        {
+            char accept_msg[320] = {};
+            sprintf_s(accept_msg,
+                "NFSTweakBridge: pre-HUD request accepted (frame=%llu bp=%llu req_bp=%llu rtv=%llu dsv=%llu score=%u)\n",
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long long>(bp),
+                static_cast<unsigned long long>(g_request_pre_hud_beginpass.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(prehud_rtv_resource.handle),
+                static_cast<unsigned long long>(prehud_dsv_resource.handle),
+                score);
+            log_info(accept_msg);
+        }
         const resource_desc prehud_desc = g_device->get_resource_desc(prehud_rtv_resource);
         if (prehud_desc.type != resource_type::texture_2d || prehud_desc.texture.samples > 1)
         {
@@ -687,11 +827,25 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         // Lock only if this pass is the actual backbuffer pass.
         if (back.handle != 0 && prehud_rtv_resource.handle == back.handle)
         {
+            const bool lock_changed =
+                g_prehud_locked_rt_resource.handle != prehud_rtv_resource.handle ||
+                g_prehud_locked_ds_resource.handle != prehud_dsv_resource.handle;
             g_prehud_locked_rt_resource = prehud_rtv_resource;
             g_prehud_locked_ds_resource = prehud_dsv_resource;
             g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
             g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
             g_active_scene_ds_signature = prehud_dsv_resource;
+            if (lock_changed)
+            {
+                char msg[320] = {};
+                sprintf_s(msg,
+                    "NFSTweakBridge: Locked pre-HUD RT/DS on backbuffer pass (frame=%llu bp=%llu rtv=%llu dsv=%llu)\n",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(bp),
+                    static_cast<unsigned long long>(prehud_rtv_resource.handle),
+                    static_cast<unsigned long long>(prehud_dsv_resource.handle));
+                log_info(msg);
+            }
         }
         else if (g_prehud_locked_rt_resource.handle == 0)
         {
@@ -701,6 +855,14 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
             g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
             g_active_scene_ds_signature = prehud_dsv_resource;
+            char msg[320] = {};
+            sprintf_s(msg,
+                "NFSTweakBridge: Locked pre-HUD RT/DS on fallback pass (frame=%llu bp=%llu rtv=%llu dsv=%llu)\n",
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long long>(bp),
+                static_cast<unsigned long long>(prehud_rtv_resource.handle),
+                static_cast<unsigned long long>(prehud_dsv_resource.handle));
+            log_info(msg);
         }
         if (rc <= 5 || (rc % 120) == 0)
         {
@@ -1457,6 +1619,24 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
     // Vulkan path: choose/bind once per frame (reduces flicker and avoids partial binds).
     if (g_device_api == device_api::vulkan)
     {
+        if (g_precip_signal_pending.exchange(false, std::memory_order_relaxed))
+        {
+            const uint32_t value = g_precip_signal_value.load(std::memory_order_relaxed);
+            g_prehud_locked_rt_resource = { 0 };
+            g_prehud_locked_ds_resource = { 0 };
+            g_active_scene_ds_signature = { 0 };
+            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+            g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
+            g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
+            g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), 8), std::memory_order_relaxed);
+
+            char msg[320] = {};
+            sprintf_s(msg,
+                "NFSTweakBridge: Bridge precipitation signal; unlocked pre-HUD RT/DS (dbg=%u).\n",
+                value);
+            log_info(msg);
+        }
+
         g_enable_vulkan_msaa_resolve.store(false, std::memory_order_relaxed);
         const prehud_runtime_state state = static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed));
         if (state == prehud_runtime_state::stabilizing)
