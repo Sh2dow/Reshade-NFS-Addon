@@ -522,6 +522,33 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             // Lock miss in this pass: keep lock and wait for matching pass later in the frame.
             if (!found_locked_pair)
             {
+                // Safe RT retarget path:
+                // If DSV still matches locked scene DSV, but RT handle changed, adopt current backbuffer RT
+                // instead of treating this as a miss. This avoids transient flicker on rapid RT swaps
+                // (e.g. wall-break/motion transitions) while keeping HUD protection via locked DSV.
+                if (prehud_dsv_resource.handle != 0 &&
+                    prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle &&
+                    back.handle != 0)
+                {
+                    for (uint32_t i = 0; i < count; ++i)
+                    {
+                        const resource rr = g_device->get_resource_from_view(rts[i].view);
+                        if (rr.handle != 0 && rr.handle == back.handle)
+                        {
+                            prehud_rtv = rts[i].view;
+                            prehud_rtv_resource = rr;
+                            found_locked_pair = true;
+                            g_prehud_locked_rt_resource = rr;
+                            g_prehud_lock_last_hit_frame.store(g_frame_index.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!found_locked_pair)
+            {
                 lock_miss_this_pass = true;
                 const uint64_t misses = g_prehud_lock_miss_frames.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (g_verbose_prehud_debug.load(std::memory_order_relaxed) &&
@@ -1622,17 +1649,21 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
         if (g_precip_signal_pending.exchange(false, std::memory_order_relaxed))
         {
             const uint32_t value = g_precip_signal_value.load(std::memory_order_relaxed);
+            // Soft weather transition handling:
+            // keep runtime phase active and only drop the current lock so selection can adapt
+            // without forcing a long stabilize cycle (which can cause visible flicker).
             g_prehud_locked_rt_resource = { 0 };
             g_prehud_locked_ds_resource = { 0 };
             g_active_scene_ds_signature = { 0 };
             g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+            g_scene_signature_streak = 0;
             g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
             g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
-            g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), 8), std::memory_order_relaxed);
+            g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), 3), std::memory_order_relaxed);
 
             char msg[320] = {};
             sprintf_s(msg,
-                "NFSTweakBridge: Bridge precipitation signal; unlocked pre-HUD RT/DS (dbg=%u).\n",
+                "NFSTweakBridge: Bridge precipitation signal; unlocked pre-HUD RT/DS (sig=0x%X).\n",
                 value);
             log_info(msg);
         }

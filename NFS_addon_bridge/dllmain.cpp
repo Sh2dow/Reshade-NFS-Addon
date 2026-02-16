@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -40,11 +41,11 @@ static std::atomic_uint64_t g_predisplay_request_count{0};
 static std::atomic_uint64_t g_blur_call_request_count{0};
 static std::mutex g_capture_mutex;
 static std::atomic_bool g_enable_capture{false};
-static std::atomic_bool g_mw_rain_tick_seen{false};
-static std::atomic_bool g_mw_rain_state_initialized{false};
-static std::atomic_bool g_mw_rain_state_last{false};
-static std::atomic_bool g_mw_precip_debug_initialized{false};
-static std::atomic_uint32_t g_mw_precip_debug_last{0};
+static std::atomic_bool g_mw_precip_state_initialized{false};
+static std::atomic_uint32_t g_mw_precip_signature_last{0};
+static std::atomic_uint32_t g_mw_precip_signature_candidate{0};
+static std::atomic_uint32_t g_mw_precip_signature_streak{0};
+static std::atomic_uint64_t g_mw_precip_last_emit_call{0};
 
 static IDirect3DSurface9 *g_sysmem_surface = nullptr;
 static D3DFORMAT g_sysmem_format = D3DFMT_UNKNOWN;
@@ -249,79 +250,64 @@ static void pump_precipitation_signal_from_hooks()
 	if (!try_resolve_exports() || g_pfnNotifyPrecipitationChanged == nullptr)
 		return;
 
-	// Primary edge source: precipitation debug flag sampled in bridge hook context.
-	// This keeps memory reads out of addon and preserves explicit bridge->addon signaling.
-	uint32_t cur_debug = 0;
-	__try
-	{
-		cur_debug = *reinterpret_cast<volatile uint32_t *>(PRECIPITATION_DEBUG_ADDR);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		cur_debug = g_mw_precip_debug_last.load(std::memory_order_relaxed);
-	}
-	if (!g_mw_precip_debug_initialized.load(std::memory_order_relaxed))
-	{
-		g_mw_precip_debug_initialized.store(true, std::memory_order_relaxed);
-		g_mw_precip_debug_last.store(cur_debug, std::memory_order_relaxed);
-	}
-	else
-	{
-		const uint32_t prev_debug = g_mw_precip_debug_last.load(std::memory_order_relaxed);
-		if (cur_debug != prev_debug)
-		{
-			g_mw_precip_debug_last.store(cur_debug, std::memory_order_relaxed);
-			const bool active = (cur_debug != 0);
-			g_mw_rain_state_initialized.store(true, std::memory_order_relaxed);
-			g_mw_rain_state_last.store(active, std::memory_order_relaxed);
-			g_pfnNotifyPrecipitationChanged(active ? 1u : 0u);
-			return;
-		}
-	}
+	// Bridge-owned precipitation state source (addon does not poll these addresses).
+	// Use render-flag edge detection with asymmetric debounce:
+	// fast ON detection, conservative OFF detection to avoid false unlocks.
+	uint32_t cur_render = 0;
+	cur_render = *reinterpret_cast<volatile uint32_t *>(PRECIPITATION_DEBUG_ADDR);
 
-	const bool active_this_frame = g_mw_rain_tick_seen.exchange(false, std::memory_order_relaxed);
-	const bool initialized = g_mw_rain_state_initialized.load(std::memory_order_relaxed);
-	const bool last = g_mw_rain_state_last.load(std::memory_order_relaxed);
-	// Fallback only: if rain tick stopped arriving entirely, emit "off" once.
-	if (initialized && last && !active_this_frame)
-	{
-		g_mw_rain_state_last.store(false, std::memory_order_relaxed);
-		g_pfnNotifyPrecipitationChanged(0u);
-	}
-#endif
-}
+	const uint64_t call_now = g_predisplay_call_count.load(std::memory_order_relaxed);
+	const uint32_t signature = (cur_render != 0) ? 0x02u : 0x00u;
 
-#if GAME_MW
-static void(__thiscall *MW_RainTick_orig)(void *self) =
-	reinterpret_cast<void(__thiscall *)(void *)>(0x00758100);
+	const uint64_t last_emit_call = g_mw_precip_last_emit_call.load(std::memory_order_relaxed);
+	constexpr uint64_t k_emit_cooldown_calls = 45;
+	const bool cooldown_ok = (call_now >= last_emit_call) && ((call_now - last_emit_call) >= k_emit_cooldown_calls);
+	constexpr uint32_t k_streak_on_needed = 3;
+	constexpr uint32_t k_streak_off_needed = 24;
 
-void __fastcall MW_RainTick_Hook(void *self, void *)
-{
-	MW_RainTick_orig(self);
-	g_mw_rain_tick_seen.store(true, std::memory_order_relaxed);
-
-	uint32_t render_flag = 0;
-	__try
+	if (!g_mw_precip_state_initialized.load(std::memory_order_relaxed))
 	{
-		render_flag = *reinterpret_cast<volatile uint32_t *>(PRECIPITATION_RENDER_ADDR);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
+		g_mw_precip_state_initialized.store(true, std::memory_order_relaxed);
+		g_mw_precip_signature_last.store(signature, std::memory_order_relaxed);
+		g_mw_precip_signature_candidate.store(signature, std::memory_order_relaxed);
+		g_mw_precip_signature_streak.store(0, std::memory_order_relaxed);
+		g_mw_precip_last_emit_call.store(call_now, std::memory_order_relaxed);
+		g_pfnNotifyPrecipitationChanged(signature);
 		return;
 	}
 
-	const bool active = (render_flag != 0);
-	const bool initialized = g_mw_rain_state_initialized.load(std::memory_order_relaxed);
-	const bool last = g_mw_rain_state_last.load(std::memory_order_relaxed);
-	if (!initialized || active != last)
+	const uint32_t committed = g_mw_precip_signature_last.load(std::memory_order_relaxed);
+	if (signature == committed)
 	{
-		g_mw_rain_state_initialized.store(true, std::memory_order_relaxed);
-		g_mw_rain_state_last.store(active, std::memory_order_relaxed);
-		if (try_resolve_exports() && g_pfnNotifyPrecipitationChanged != nullptr)
-			g_pfnNotifyPrecipitationChanged(active ? 1u : 0u);
+		g_mw_precip_signature_candidate.store(signature, std::memory_order_relaxed);
+		g_mw_precip_signature_streak.store(0, std::memory_order_relaxed);
+		return;
 	}
-}
+
+	uint32_t candidate = g_mw_precip_signature_candidate.load(std::memory_order_relaxed);
+	uint32_t streak = g_mw_precip_signature_streak.load(std::memory_order_relaxed);
+	if (candidate != signature)
+	{
+		candidate = signature;
+		streak = 1;
+	}
+	else
+	{
+		streak += 1;
+	}
+	g_mw_precip_signature_candidate.store(candidate, std::memory_order_relaxed);
+	g_mw_precip_signature_streak.store(streak, std::memory_order_relaxed);
+
+	const uint32_t needed = (signature != 0) ? k_streak_on_needed : k_streak_off_needed;
+	if (streak >= needed && cooldown_ok)
+	{
+		g_mw_precip_signature_last.store(signature, std::memory_order_relaxed);
+		g_mw_precip_signature_streak.store(0, std::memory_order_relaxed);
+		g_mw_precip_last_emit_call.store(call_now, std::memory_order_relaxed);
+		g_pfnNotifyPrecipitationChanged(signature);
+	}
 #endif
+}
 
 // The original FEManager_Render function pointer
 void(__thiscall *FEManager_Render_orig)(unsigned int thisptr) = (void(__thiscall *)(unsigned int))FEMANAGER_RENDER_ADDRESS;
@@ -460,8 +446,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 #ifdef GAME_MW
 				injector::MakeCALL(0x006DBE8B, MW_BlurPass_Hook, true);
 				injector::MakeCALL(0x006DBEB0, MW_BlurPass_Hook, true);
-				// Hook rain tick callsite in sub_6DE300 to get event-driven precipitation state edges.
-				injector::MakeCALL(0x006DF545, MW_RainTick_Hook, true);
 #endif
 #endif
 
