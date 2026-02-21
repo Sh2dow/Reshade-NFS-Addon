@@ -347,8 +347,10 @@ int __cdecl PreDisplay_Render_Hook(int a1)
 {
 #if GAME_MW
 	g_predisplay_call_count.fetch_add(1);
-	// Trigger exactly on sub_6E6E40(0), which is the second display-phase call in eDisplayFrame.
-	// This is a stronger pre-HUD boundary than FEManager::Render helper internals.
+	// IMPORTANT: sub_6E6E40(0) performs device SetRenderTarget/SetDepthStencilSurface calls
+	// (IDA: call [ecx+94h] @ 0x6E6E6B, call [ecx+9Ch] @ 0x6E6E80).
+	// So execute original first, then request pre-HUD so addon sees the updated RT/DS state.
+	const int ret = PreDisplay_Render_orig(a1);
 	if (a1 == 0)
 	{
 		g_predisplay_zero_count.fetch_add(1);
@@ -366,15 +368,13 @@ int __cdecl PreDisplay_Render_Hook(int a1)
 				g_pfnRequestPreHudEffects();
 				g_predisplay_request_count.fetch_add(1);
 			}
-
-			// Keep this hook lightweight/stable: avoid depth readback work here.
-			// Vulkan path uses runtime depth binding from the add-on side.
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
 			OutputDebugStringA("NFS_Addon_Bridge: PreDisplay_Render_Hook exception suppressed.\n");
 		}
 	}
+	return ret;
 #endif
 	return PreDisplay_Render_orig(a1);
 }

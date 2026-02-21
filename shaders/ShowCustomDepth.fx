@@ -17,6 +17,12 @@ uniform float HazeStrength = 0.35;  // blend amount
 uniform float HazeBias     = 2.0;
 uniform float3 HazeColor   = float3(0.88, 0.8, 0.4);
 
+float4 VS_Fullscreen(uint id : SV_VertexID, out float2 uv : TEXCOORD) : SV_Position
+{
+    uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
 float4 PS_RawDepth_CompressWhite_Haze(float4 pos : SV_Position, float2 uv : TexCoord) : SV_Target
 {
     float d = tex2D(sDepth, uv).r;
@@ -36,7 +42,7 @@ float4 PS_RawDepth_CompressWhite_Haze(float4 pos : SV_Position, float2 uv : TexC
     return float4(col, 1.0);
 }
 
-float4 PS_UsableDepth(float2 uv : TEXCOORD) : SV_Target
+float4 PS_UsableDepth(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     float3 scene = tex2D(sColor, uv).rgb;
 
@@ -61,7 +67,7 @@ technique DebugCustomDepth
 {
     pass
     {
-        VertexShader = PostProcessVS;
+        VertexShader = VS_Fullscreen;
         PixelShader  = PS_UsableDepth;
     }
 }
