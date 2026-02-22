@@ -100,6 +100,7 @@ static bool try_resolve_exports()
 	return false;
 }
 
+
 static bool throttle_capture(uint32_t hz)
 {
 	LARGE_INTEGER freq = {}, now = {};
@@ -385,32 +386,7 @@ int __cdecl MW_BlurPass_Hook(
 	uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8)
 {
 	const int ret = MW_BlurPass_orig(a1, a2, a3, a4, a5, a6, a7, a8);
-
-	// Anchor pre-HUD request only to strong blur variant (0x0E/0x0F).
-	// The medium variant (8/7) tends to align with post-like phases and can contaminate HUD.
-	const bool strong_blur_variant = (a6 == 0x0E && a7 == 0x0F);
-	if (!strong_blur_variant)
-		return ret;
-
-	// Strong blur active: nudge pre-HUD request timing toward early scene phase.
-	__try
-	{
-		try_resolve_exports();
-		if (g_pfnRenderEffectsPreHudNow)
-		{
-			g_pfnRenderEffectsPreHudNow();
-			g_blur_call_request_count.fetch_add(1, std::memory_order_relaxed);
-		}
-		else if (g_pfnRequestPreHudEffects)
-		{
-			g_pfnRequestPreHudEffects();
-			g_blur_call_request_count.fetch_add(1, std::memory_order_relaxed);
-		}
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		OutputDebugStringA("NFS_Addon_Bridge: MW_BlurPass_Hook exception suppressed.\n");
-	}
+	(void)a5; (void)a6; (void)a7; (void)a8;
 
 	return ret;
 }

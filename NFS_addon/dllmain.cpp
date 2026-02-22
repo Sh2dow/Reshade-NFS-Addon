@@ -232,6 +232,7 @@ void NFSTweak_NotifyPrecipitationChanged(unsigned int value)
     g_precip_signal_pending.store(true, std::memory_order_relaxed);
 }
 
+
 // Vulkan/DXVK: called whenever application binds render targets + depth (lets us discover the active depth buffer).
 static void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uint32_t count, const resource_view *rtvs, resource_view dsv)
 {
@@ -504,29 +505,21 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             // Lock miss in this pass: keep lock and wait for matching pass later in the frame.
             if (!found_locked_pair)
             {
-                // If scene DSV is unchanged but RT handle churned, retarget to current backbuffer RT.
-                if (prehud_dsv_resource.handle != 0 &&
-                    prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle &&
-                    back.handle != 0)
-                {
-                    for (uint32_t i = 0; i < count; ++i)
-                    {
-                        const resource rr = g_device->get_resource_from_view(rts[i].view);
-                        if (rr.handle != 0 && rr.handle == back.handle)
-                        {
-                            prehud_rtv = rts[i].view;
-                            prehud_rtv_resource = rr;
-                            found_locked_pair = true;
-                            g_prehud_locked_rt_resource = rr;
-                            g_prehud_lock_last_hit_frame.store(g_frame_index.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
-                            break;
-                        }
-                    }
-                }
-
                 if (!found_locked_pair)
+                {
+                    const uint64_t misses = g_prehud_lock_miss_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (misses >= 512)
+                    {
+                        g_prehud_locked_rt_resource = { 0 };
+                        g_prehud_locked_ds_resource = { 0 };
+                        g_active_scene_ds_signature = { 0 };
+                        g_scene_signature_streak = 0;
+                        // Do not bounce to 'armed' here: that causes repeated active re-entry churn and flicker.
+                        // Keep current runtime state and let selection recover with lock cleared.
+                        g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+                    }
                     lock_miss_this_pass = true;
+                }
             }
         }
 
@@ -594,6 +587,8 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             wants_prehud = false;
         }
     }
+    const prehud_runtime_state runtime_state =
+        static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed));
     const bool scene_signature_candidate =
         prehud_rtv_resource.handle != 0 &&
         prehud_dsv_resource.handle != 0 &&
@@ -601,8 +596,8 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
 
     if (scene_signature_candidate)
     {
-        if (g_last_scene_rt_signature.handle == prehud_rtv_resource.handle &&
-            g_last_scene_ds_signature.handle == prehud_dsv_resource.handle)
+        // DSV is the stronger scene identity signal here; RT handle can legitimately churn.
+        if (g_last_scene_ds_signature.handle == prehud_dsv_resource.handle)
         {
             ++g_scene_signature_streak;
         }
@@ -613,7 +608,7 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             g_scene_signature_streak = 1;
         }
 
-        if (static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed)) == prehud_runtime_state::armed &&
+        if (runtime_state == prehud_runtime_state::armed &&
             g_scene_signature_streak >= k_prehud_streak_required)
         {
             g_prehud_runtime_state.store(static_cast<int>(prehud_runtime_state::active), std::memory_order_relaxed);
@@ -625,7 +620,7 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         g_scene_signature_streak = 0;
     }
 
-    if (static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed)) == prehud_runtime_state::active &&
+    if (runtime_state == prehud_runtime_state::active &&
         g_active_scene_ds_signature.handle != 0 &&
         prehud_dsv_resource.handle != 0 &&
         prehud_dsv_resource.handle != g_active_scene_ds_signature.handle)
@@ -661,11 +656,34 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
     const bool render_cooldown_ok = (last_render_bp == 0) || (bp > last_render_bp && (bp - last_render_bp) >= 16);
     const uint64_t last_manual_frame = g_last_manual_prehud_frame.load(std::memory_order_relaxed);
     const bool not_rendered_this_frame = (last_manual_frame != frame);
+    const bool lock_pair_hit =
+        g_prehud_locked_rt_resource.handle != 0 &&
+        g_prehud_locked_ds_resource.handle != 0 &&
+        prehud_rtv_resource.handle == g_prehud_locked_rt_resource.handle &&
+        prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle;
+    const bool fallback_allow_without_request =
+        runtime_state == prehud_runtime_state::active &&
+        !wants_prehud &&
+        not_rendered_this_frame &&
+        render_cooldown_ok &&
+        in_early_frame_phase &&
+        score >= 600 &&
+        lock_pair_hit;
+
+    if (fallback_allow_without_request)
+    {
+        // Bridge request timing can drift during heavy frame graph changes.
+        // Keep one deterministic pre-HUD render on the locked scene signature.
+        wants_prehud = true;
+        g_request_pre_hud_frame.store(frame, std::memory_order_relaxed);
+        g_request_pre_hud_beginpass.store((bp > 0) ? (bp - 1) : bp, std::memory_order_relaxed);
+        g_request_pre_hud_effects.store(true, std::memory_order_relaxed);
+    }
 
     if (g_enable_vulkan_beginpass_prehud.load() &&
         g_enable_manual_prehud_render.load(std::memory_order_relaxed) &&
         !g_disable_beginpass_after_fault.load(std::memory_order_relaxed) &&
-        static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed)) == prehud_runtime_state::active &&
+        runtime_state == prehud_runtime_state::active &&
         frame >= g_manual_render_ready_frame.load(std::memory_order_relaxed) &&
         cmd_list != nullptr &&
         prehud_rtv.handle != 0 &&
@@ -673,7 +691,7 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         prehud_dsv_resource.handle != 0 &&
         wants_prehud &&
         g_request_pre_hud_frame.load(std::memory_order_relaxed) == frame &&
-        request_in_tight_window &&
+        (request_in_tight_window || fallback_allow_without_request) &&
         in_early_frame_phase &&
         render_cooldown_ok &&
         not_rendered_this_frame &&
@@ -719,18 +737,9 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         g_request_pre_hud_effects.store(false);
         g_manual_prehud_primed.store(true, std::memory_order_relaxed);
         g_last_manual_prehud_frame.store(frame, std::memory_order_relaxed);
-        // Lock only if this pass is the actual backbuffer pass.
-        if (back.handle != 0 && prehud_rtv_resource.handle == back.handle)
+        // Acquire lock once and keep it sticky until explicit reset/re-stabilize.
+        if (g_prehud_locked_rt_resource.handle == 0)
         {
-            g_prehud_locked_rt_resource = prehud_rtv_resource;
-            g_prehud_locked_ds_resource = prehud_dsv_resource;
-            g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
-            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
-            g_active_scene_ds_signature = prehud_dsv_resource;
-        }
-        else if (g_prehud_locked_rt_resource.handle == 0)
-        {
-            // If exact backbuffer is unavailable on this runtime, lock first stable full-res candidate.
             g_prehud_locked_rt_resource = prehud_rtv_resource;
             g_prehud_locked_ds_resource = prehud_dsv_resource;
             g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
@@ -1482,6 +1491,7 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
         if (g_precip_signal_pending.exchange(false, std::memory_order_relaxed))
         {
             const uint32_t value = g_precip_signal_value.load(std::memory_order_relaxed);
+            const bool precip_on = (value != 0);
             g_prehud_locked_rt_resource = { 0 };
             g_prehud_locked_ds_resource = { 0 };
             g_active_scene_ds_signature = { 0 };
@@ -1489,13 +1499,18 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
             g_scene_signature_streak = 0;
             g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
             g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
-            g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), 4), std::memory_order_relaxed);
+            g_prehud_runtime_state.store(static_cast<int>(prehud_runtime_state::stabilizing), std::memory_order_relaxed);
+            const int settle_frames = precip_on ? 24 : 12;
+            const int skip_frames = precip_on ? 16 : 8;
+            const uint64_t ready_after = precip_on ? 90 : 45;
+            g_transition_settle_frames.store(settle_frames, std::memory_order_relaxed);
+            g_skip_manual_prehud_frames.store(std::max(g_skip_manual_prehud_frames.load(std::memory_order_relaxed), skip_frames), std::memory_order_relaxed);
+            g_manual_render_ready_frame.store(std::max(g_manual_render_ready_frame.load(std::memory_order_relaxed), frame + ready_after), std::memory_order_relaxed);
 
             char msg[160] = {};
-            sprintf_s(msg, "NFSTweakBridge: Bridge precipitation signal; unlocking pre-HUD lock (sig=0x%X).\n", value);
+            sprintf_s(msg, "NFSTweakBridge: Bridge precipitation %s; re-stabilizing pre-HUD lock (sig=0x%X).\n", precip_on ? "ON" : "OFF", value);
             log_info(msg);
         }
-
         g_enable_vulkan_msaa_resolve.store(false, std::memory_order_relaxed);
         const prehud_runtime_state state = static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed));
         if (state == prehud_runtime_state::stabilizing)
