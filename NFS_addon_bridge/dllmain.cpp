@@ -25,13 +25,11 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 using PFN_NFSTweak_PushDepthSurface = void(__cdecl *)(void *d3d9_surface, unsigned int width, unsigned int height);
 using PFN_NFSTweak_PushDepthBufferR32F = void(__cdecl *)(const void *data, unsigned int width, unsigned int height, unsigned int row_pitch_bytes);
 using PFN_NFSTweak_RequestPreHudEffects = void(__cdecl *)();
-using PFN_NFSTweak_RenderEffectsPreHudNow = void(__cdecl *)();
 using PFN_NFSTweak_NotifyPrecipitationChanged = void(__cdecl *)(unsigned int value);
 
 static PFN_NFSTweak_PushDepthSurface g_pfnPushDepthSurface = nullptr;
 static PFN_NFSTweak_PushDepthBufferR32F g_pfnPushDepthBufferR32F = nullptr;
 static PFN_NFSTweak_RequestPreHudEffects g_pfnRequestPreHudEffects = nullptr;
-static PFN_NFSTweak_RenderEffectsPreHudNow g_pfnRenderEffectsPreHudNow = nullptr;
 static PFN_NFSTweak_NotifyPrecipitationChanged g_pfnNotifyPrecipitationChanged = nullptr;
 
 static std::atomic_uint64_t g_last_capture_qpc{0};
@@ -39,6 +37,7 @@ static std::atomic_uint64_t g_predisplay_call_count{0};
 static std::atomic_uint64_t g_predisplay_zero_count{0};
 static std::atomic_uint64_t g_predisplay_request_count{0};
 static std::atomic_uint64_t g_blur_call_request_count{0};
+static std::atomic_uint64_t g_last_zero_request_call{0};
 static std::mutex g_capture_mutex;
 static std::atomic_bool g_enable_capture{false};
 static std::atomic_bool g_mw_precip_state_initialized{false};
@@ -63,9 +62,8 @@ static bool try_resolve_exports()
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(h, "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(h, "NFSTweak_PushDepthSurface"));
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(h, "NFSTweak_RequestPreHudEffects"));
-		g_pfnRenderEffectsPreHudNow = reinterpret_cast<PFN_NFSTweak_RenderEffectsPreHudNow>(GetProcAddress(h, "NFSTweak_RenderEffectsPreHudNow"));
 		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(h, "NFSTweak_NotifyPrecipitationChanged"));
-		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnRenderEffectsPreHudNow || g_pfnNotifyPrecipitationChanged);
+		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnNotifyPrecipitationChanged);
 	}
 
 	// Scan modules (robust against renamed addon file)
@@ -83,8 +81,6 @@ static bool try_resolve_exports()
 		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects");
 		if (!p)
-			p = GetProcAddress(modules[i], "NFSTweak_RenderEffectsPreHudNow");
-		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged");
 		if (!p)
 			continue;
@@ -92,7 +88,6 @@ static bool try_resolve_exports()
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(modules[i], "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(modules[i], "NFSTweak_PushDepthSurface"));
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects"));
-		g_pfnRenderEffectsPreHudNow = reinterpret_cast<PFN_NFSTweak_RenderEffectsPreHudNow>(GetProcAddress(modules[i], "NFSTweak_RenderEffectsPreHudNow"));
 		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged"));
 		return true;
 	}
@@ -327,15 +322,8 @@ void __stdcall FEManager_Render_Hook()
 #endif
 
 #if GAME_MW
-	// Always try to resolve exports from the addon at this hook point.
-	// This keeps pre-HUD signaling independent from depth capture path state.
+	// Resolve exports for depth/capture paths.
 	try_resolve_exports();
-
-	// Request/execute pre-HUD effects every FE render tick.
-	if (g_pfnRenderEffectsPreHudNow)
-		g_pfnRenderEffectsPreHudNow();
-	else if (g_pfnRequestPreHudEffects)
-		g_pfnRequestPreHudEffects();
 
 	IDirect3DDevice9 *dev = *(IDirect3DDevice9 **)NFS_D3D9_DEVICE_ADDRESS;
 	capture_and_push_depth(dev);
@@ -352,28 +340,36 @@ int __cdecl PreDisplay_Render_Hook(int a1)
 	// (IDA: call [ecx+94h] @ 0x6E6E6B, call [ecx+9Ch] @ 0x6E6E80).
 	// So execute original first, then request pre-HUD so addon sees the updated RT/DS state.
 	const int ret = PreDisplay_Render_orig(a1);
-	if (a1 == 0)
+	__try
 	{
-		g_predisplay_zero_count.fetch_add(1);
-		__try
+		const uint64_t call_now = g_predisplay_call_count.load(std::memory_order_relaxed);
+		const bool is_primary_prehud = (a1 == 0);
+		if (is_primary_prehud)
+			g_predisplay_zero_count.fetch_add(1);
+		try_resolve_exports();
+		pump_precipitation_signal_from_hooks();
+		if (g_pfnRequestPreHudEffects && is_primary_prehud)
 		{
-			try_resolve_exports();
-			pump_precipitation_signal_from_hooks();
-			if (g_pfnRenderEffectsPreHudNow)
-			{
-				g_pfnRenderEffectsPreHudNow();
-				g_predisplay_request_count.fetch_add(1);
-			}
-			else if (g_pfnRequestPreHudEffects)
+			g_pfnRequestPreHudEffects();
+			g_predisplay_request_count.fetch_add(1);
+			g_last_zero_request_call.store(call_now, std::memory_order_relaxed);
+		}
+		else if (g_pfnRequestPreHudEffects)
+		{
+			// Guarded fallback: some transitions stop producing a1==0 for a while.
+			// Emit a sparse signal so add-on can recover, without flooding wrong phases.
+			const uint64_t last_zero = g_last_zero_request_call.load(std::memory_order_relaxed);
+			if (last_zero != 0 && call_now > last_zero && (call_now - last_zero) >= 240)
 			{
 				g_pfnRequestPreHudEffects();
 				g_predisplay_request_count.fetch_add(1);
+				g_last_zero_request_call.store(call_now, std::memory_order_relaxed);
 			}
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			OutputDebugStringA("NFS_Addon_Bridge: PreDisplay_Render_Hook exception suppressed.\n");
-		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		OutputDebugStringA("NFS_Addon_Bridge: PreDisplay_Render_Hook exception suppressed.\n");
 	}
 	return ret;
 #endif
