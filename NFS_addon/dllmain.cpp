@@ -54,6 +54,7 @@ static std::atomic_bool g_suppress_regular_post_hud_pass(true);
 static std::atomic_bool g_enable_vulkan_beginpass_prehud(true);
 static std::atomic_bool g_enable_manual_prehud_render(true);
 static std::atomic_bool g_enable_active_dsv_promotion(false);
+static std::atomic_bool g_enable_rt_lock_migration(false);
 static std::atomic_int g_skip_manual_prehud_frames(0);
 enum class prehud_runtime_state : int { disabled = 0, stabilizing = 1, armed = 2, active = 3 };
 static std::atomic_int g_prehud_runtime_state(static_cast<int>(prehud_runtime_state::disabled));
@@ -72,6 +73,8 @@ static resource g_prehud_locked_ds_resource = { 0 };
 static std::atomic_uint64_t g_prehud_lock_last_hit_frame(0);
 static std::atomic_uint64_t g_prehud_lock_miss_frames(0);
 static std::atomic_uint64_t g_prehud_lock_miss_last_frame(0);
+static std::atomic_uint64_t g_prehud_dsv_mismatch_frames(0);
+static std::atomic_uint64_t g_prehud_dsv_mismatch_last_frame(0);
 static resource g_prehud_rt_migration_candidate = { 0 };
 static int g_prehud_rt_migration_streak = 0;
 static std::atomic_uint64_t g_prehud_rt_last_migration_frame(0);
@@ -167,6 +170,8 @@ static void reset_prehud_transition(const char *reason, int settle_frames)
     g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
     g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
     g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+    g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+    g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
     g_prehud_rt_migration_candidate = { 0 };
     g_prehud_rt_migration_streak = 0;
     g_prehud_rt_last_migration_frame.store(0, std::memory_order_relaxed);
@@ -552,16 +557,36 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
                     }
                 }
 
-                // If DSV changed to another valid non-MSAA target, drop old lock immediately
-                // so selection/promotion logic below can recover in this pass.
+                // Do not drop lock on the first DSV mismatch. Tunnel/rain/camera transitions can
+                // present transient non-scene DSVs for a few passes and then recover.
                 if (!same_locked_ds && prehud_dsv_non_msaa)
                 {
-                    g_prehud_locked_rt_resource = { 0 };
-                    g_prehud_locked_ds_resource = { 0 };
-                    g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
-                    g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
-                    g_prehud_rt_migration_candidate = { 0 };
-                    g_prehud_rt_migration_streak = 0;
+                    if (g_prehud_dsv_mismatch_last_frame.load(std::memory_order_relaxed) != frame_now)
+                    {
+                        g_prehud_dsv_mismatch_last_frame.store(frame_now, std::memory_order_relaxed);
+                        g_prehud_dsv_mismatch_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    constexpr uint64_t k_dsv_mismatch_relock_frames = 18;
+                    if (g_prehud_dsv_mismatch_frames.load(std::memory_order_relaxed) >= k_dsv_mismatch_relock_frames)
+                    {
+                        g_prehud_locked_rt_resource = { 0 };
+                        g_prehud_locked_ds_resource = { 0 };
+                        g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+                        g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+                        g_prehud_rt_migration_candidate = { 0 };
+                        g_prehud_rt_migration_streak = 0;
+                        g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+                        g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        lock_miss_this_pass = true;
+                    }
+                }
+                else if (same_locked_ds)
+                {
+                    g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+                    g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
                 }
 
                 resource candidate_rt = { 0 };
@@ -636,6 +661,13 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
 
                 if (candidate_rt.handle != 0 && candidate_rt.handle != g_prehud_locked_rt_resource.handle)
                 {
+                    if (!g_enable_rt_lock_migration.load(std::memory_order_relaxed))
+                    {
+                        // Keep RT lock deterministic: do not chase alternating scene RTs in chase/tunnel/weather phases.
+                        lock_miss_this_pass = true;
+                    }
+                    else
+                    {
                     if (g_prehud_rt_migration_candidate.handle == candidate_rt.handle)
                         ++g_prehud_rt_migration_streak;
                     else
@@ -664,6 +696,7 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
                     else
                     {
                         lock_miss_this_pass = true;
+                    }
                     }
                 }
                 else
@@ -696,6 +729,8 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
                             g_scene_signature_streak = 0;
                             g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
                             g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+                            g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+                            g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
                             g_prehud_runtime_state.store(static_cast<int>(prehud_runtime_state::armed), std::memory_order_relaxed);
                             g_request_pre_hud_frame.store(frame_now, std::memory_order_relaxed);
                             g_request_pre_hud_beginpass.store(bp, std::memory_order_relaxed);
@@ -728,6 +763,8 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             {
                 g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
                 g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+                g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+                g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
                 g_prehud_rt_migration_candidate = { 0 };
                 g_prehud_rt_migration_streak = 0;
             }
@@ -925,6 +962,13 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
     const bool render_cooldown_ok = (last_render_bp == 0) || (bp > last_render_bp && (bp - last_render_bp) >= 10);
     const uint64_t last_manual_frame = g_last_manual_prehud_frame.load(std::memory_order_relaxed);
     const bool not_rendered_this_frame = (last_manual_frame != frame);
+    const bool lock_empty =
+        (g_prehud_locked_rt_resource.handle == 0) || (g_prehud_locked_ds_resource.handle == 0);
+    const bool lock_match =
+        !lock_empty &&
+        prehud_rtv_resource.handle == g_prehud_locked_rt_resource.handle &&
+        prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle;
+    const bool render_on_locked_signature = lock_empty || lock_match;
 
     if (g_enable_vulkan_beginpass_prehud.load() &&
         g_enable_manual_prehud_render.load(std::memory_order_relaxed) &&
@@ -939,6 +983,7 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         g_request_pre_hud_frame.load(std::memory_order_relaxed) == frame &&
         request_in_tight_window &&
         in_early_frame_phase &&
+        render_on_locked_signature &&
         render_cooldown_ok &&
         not_rendered_this_frame &&
         !g_pre_hud_effects_issued_this_frame.load(std::memory_order_relaxed) &&
@@ -984,23 +1029,28 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         g_watchdog_fired_since_render.store(false, std::memory_order_relaxed);
         g_manual_prehud_primed.store(true, std::memory_order_relaxed);
         g_last_manual_prehud_frame.store(frame, std::memory_order_relaxed);
-        // Lock only if this pass is the actual backbuffer pass.
-        if (back.handle != 0 && prehud_rtv_resource.handle == back.handle)
-        {
-            g_prehud_locked_rt_resource = prehud_rtv_resource;
-            g_prehud_locked_ds_resource = prehud_dsv_resource;
-            g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
-            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
-            g_active_scene_ds_signature = prehud_dsv_resource;
-        }
-        else if (g_prehud_locked_rt_resource.handle == 0)
+        // Sticky lock model: set RT/DS lock once after stabilization and keep it until explicit reset/re-stabilize.
+        // This avoids backbuffer-handle churn flipping the lock during chase/weather phases.
+        if (g_prehud_locked_rt_resource.handle == 0)
         {
             // If exact backbuffer is unavailable on this runtime, lock first stable full-res candidate.
             g_prehud_locked_rt_resource = prehud_rtv_resource;
             g_prehud_locked_ds_resource = prehud_dsv_resource;
             g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
             g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+            g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+            g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+            g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
             g_active_scene_ds_signature = prehud_dsv_resource;
+        }
+        else if (prehud_rtv_resource.handle == g_prehud_locked_rt_resource.handle &&
+                 prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle)
+        {
+            g_prehud_lock_last_hit_frame.store(frame, std::memory_order_relaxed);
+            g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+            g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+            g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+            g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
         }
         if (rc <= 5 || (rc % 120) == 0)
         {
@@ -1736,6 +1786,9 @@ static void on_destroy_effect_runtime(effect_runtime *runtime)
     g_prehud_locked_ds_resource = { 0 };
     g_prehud_lock_last_hit_frame.store(0, std::memory_order_relaxed);
     g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+    g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+    g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+    g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
     g_last_precip_signal_value.store(0xFFFFFFFFu, std::memory_order_relaxed);
     g_last_precip_signal_frame.store(0, std::memory_order_relaxed);
 }
@@ -1823,6 +1876,8 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
                 g_scene_signature_streak = 0;
                 g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
                 g_prehud_lock_miss_last_frame.store(0, std::memory_order_relaxed);
+                g_prehud_dsv_mismatch_frames.store(0, std::memory_order_relaxed);
+                g_prehud_dsv_mismatch_last_frame.store(0, std::memory_order_relaxed);
                 g_prehud_rt_migration_candidate = { 0 };
                 g_prehud_rt_migration_streak = 0;
                 g_prehud_runtime_state.store(static_cast<int>(prehud_runtime_state::armed), std::memory_order_relaxed);
