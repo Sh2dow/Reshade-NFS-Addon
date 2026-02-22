@@ -61,6 +61,9 @@ static resource g_last_scene_rt_signature = { 0 };
 static resource g_last_scene_ds_signature = { 0 };
 static int g_scene_signature_streak = 0;
 static resource g_active_scene_ds_signature = { 0 };
+static resource g_active_mismatch_rt_signature = { 0 };
+static resource g_active_mismatch_ds_signature = { 0 };
+static int g_active_mismatch_streak = 0;
 static constexpr int k_prehud_streak_required = 3;
 static resource g_prehud_locked_rt_resource = { 0 };
 static resource g_prehud_locked_ds_resource = { 0 };
@@ -155,6 +158,9 @@ static void reset_prehud_transition(const char *reason, int settle_frames)
     g_last_scene_ds_signature = { 0 };
     g_scene_signature_streak = 0;
     g_active_scene_ds_signature = { 0 };
+    g_active_mismatch_rt_signature = { 0 };
+    g_active_mismatch_ds_signature = { 0 };
+    g_active_mismatch_streak = 0;
     g_manual_prehud_primed.store(false, std::memory_order_relaxed);
     g_last_manual_prehud_frame.store(0, std::memory_order_relaxed);
     const uint64_t frame = g_frame_index.load(std::memory_order_relaxed);
@@ -507,17 +513,9 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             {
                 if (!found_locked_pair)
                 {
-                    const uint64_t misses = g_prehud_lock_miss_frames.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (misses >= 512)
-                    {
-                        g_prehud_locked_rt_resource = { 0 };
-                        g_prehud_locked_ds_resource = { 0 };
-                        g_active_scene_ds_signature = { 0 };
-                        g_scene_signature_streak = 0;
-                        // Do not bounce to 'armed' here: that causes repeated active re-entry churn and flicker.
-                        // Keep current runtime state and let selection recover with lock cleared.
-                        g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
-                    }
+                    g_prehud_lock_miss_frames.fetch_add(1, std::memory_order_relaxed);
+                    // Keep lock sticky across transient pass storms.
+                    // Lock transitions are handled explicitly by weather/reload/reset paths.
                     lock_miss_this_pass = true;
                 }
             }
@@ -596,8 +594,9 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
 
     if (scene_signature_candidate)
     {
-        // DSV is the stronger scene identity signal here; RT handle can legitimately churn.
-        if (g_last_scene_ds_signature.handle == prehud_dsv_resource.handle)
+        // Unlocked phase: require RT+DS stability to avoid transient wrong-RT picks.
+        if (g_last_scene_rt_signature.handle == prehud_rtv_resource.handle &&
+            g_last_scene_ds_signature.handle == prehud_dsv_resource.handle)
         {
             ++g_scene_signature_streak;
         }
@@ -625,10 +624,64 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         prehud_dsv_resource.handle != 0 &&
         prehud_dsv_resource.handle != g_active_scene_ds_signature.handle)
     {
-        // Strict lock mode: ignore transient DSV switches instead of resetting selection.
-        // This avoids pass re-selection spikes that can hit HUD/post passes.
-        try_bind_vulkan_depth(ds->view, score);
-        return;
+        // Tunnel/cutscene transitions can move to a new stable scene RT/DS for many frames.
+        // Migrate only after repeated identical mismatch to avoid transient pass hopping.
+        if (score >= 600 && prehud_rtv_resource.handle != 0)
+        {
+            if (g_active_mismatch_rt_signature.handle == prehud_rtv_resource.handle &&
+                g_active_mismatch_ds_signature.handle == prehud_dsv_resource.handle)
+            {
+                ++g_active_mismatch_streak;
+            }
+            else
+            {
+                g_active_mismatch_rt_signature = prehud_rtv_resource;
+                g_active_mismatch_ds_signature = prehud_dsv_resource;
+                g_active_mismatch_streak = 1;
+            }
+
+            if (g_active_mismatch_streak >= 6)
+            {
+                g_prehud_locked_rt_resource = prehud_rtv_resource;
+                g_prehud_locked_ds_resource = prehud_dsv_resource;
+                g_active_scene_ds_signature = prehud_dsv_resource;
+                g_prehud_lock_miss_frames.store(0, std::memory_order_relaxed);
+                g_active_mismatch_rt_signature = { 0 };
+                g_active_mismatch_ds_signature = { 0 };
+                g_active_mismatch_streak = 0;
+
+                char msg[320] = {};
+                sprintf_s(msg,
+                    "NFSTweakBridge: Active mismatch migrated lock (frame=%llu bp=%llu rtv=%llu dsv=%llu score=%u).\n",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(bp),
+                    static_cast<unsigned long long>(prehud_rtv_resource.handle),
+                    static_cast<unsigned long long>(prehud_dsv_resource.handle),
+                    score);
+                log_info(msg);
+            }
+            else
+            {
+                try_bind_vulkan_depth(ds->view, score);
+                return;
+            }
+        }
+        else
+        {
+            g_active_mismatch_rt_signature = { 0 };
+            g_active_mismatch_ds_signature = { 0 };
+            g_active_mismatch_streak = 0;
+            // Strict lock mode: ignore transient DSV switches instead of resetting selection.
+            // This avoids pass re-selection spikes that can hit HUD/post passes.
+            try_bind_vulkan_depth(ds->view, score);
+            return;
+        }
+    }
+    else
+    {
+        g_active_mismatch_rt_signature = { 0 };
+        g_active_mismatch_ds_signature = { 0 };
+        g_active_mismatch_streak = 0;
     }
 
     // Request timing from bridge often lands right before the first scene pass candidate.
