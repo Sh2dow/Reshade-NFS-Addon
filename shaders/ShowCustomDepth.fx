@@ -15,7 +15,11 @@ uniform float HazeStart    = 0.6;   // where haze begins (compressed depth)
 uniform float HazeEnd      = 0.95;  // full haze
 uniform float HazeStrength = 0.35;  // blend amount
 uniform float HazeBias     = 2.0;
-uniform float3 HazeColor   = float3(0.88, 0.8, 0.4);
+//uniform float3 HazeColor   = float3(0.88, 0.8, 0.4);  // piss filter
+//uniform float3 HazeColor = float3(0.62, 0.64, 0.58);    // SH1
+uniform float3 HazeColor = float3(0.68, 0.67, 0.61);    // SH2 outdoor daytime
+//uniform float3 HazeColor = float3(0.58, 0.60, 0.59);    // Silent Hill 3 (more neutral gray)
+//uniform float3 HazeColor = float3(0.52, 0.55, 0.53);    // Silent Hill heavy fog / dense haze
 
 float4 VS_Fullscreen(uint id : SV_VertexID, out float2 uv : TEXCOORD) : SV_Position
 {

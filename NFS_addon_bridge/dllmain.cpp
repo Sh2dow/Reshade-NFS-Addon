@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
-#include <cstring>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -25,30 +24,158 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 using PFN_NFSTweak_PushDepthSurface = void(__cdecl *)(void *d3d9_surface, unsigned int width, unsigned int height);
 using PFN_NFSTweak_PushDepthBufferR32F = void(__cdecl *)(const void *data, unsigned int width, unsigned int height, unsigned int row_pitch_bytes);
 using PFN_NFSTweak_RequestPreHudEffects = void(__cdecl *)();
+using PFN_NFSTweak_BeginPreHudWindow = void(__cdecl *)(unsigned int token);
+using PFN_NFSTweak_EndPreHudWindow = void(__cdecl *)(unsigned int token);
 using PFN_NFSTweak_NotifyPrecipitationChanged = void(__cdecl *)(unsigned int value);
+using PFN_NFSTweak_NotifyPhaseInvalidate = void(__cdecl *)(unsigned int reason);
 
 static PFN_NFSTweak_PushDepthSurface g_pfnPushDepthSurface = nullptr;
 static PFN_NFSTweak_PushDepthBufferR32F g_pfnPushDepthBufferR32F = nullptr;
 static PFN_NFSTweak_RequestPreHudEffects g_pfnRequestPreHudEffects = nullptr;
+static PFN_NFSTweak_BeginPreHudWindow g_pfnBeginPreHudWindow = nullptr;
+static PFN_NFSTweak_EndPreHudWindow g_pfnEndPreHudWindow = nullptr;
 static PFN_NFSTweak_NotifyPrecipitationChanged g_pfnNotifyPrecipitationChanged = nullptr;
+static PFN_NFSTweak_NotifyPhaseInvalidate g_pfnNotifyPhaseInvalidate = nullptr;
 
 static std::atomic_uint64_t g_last_capture_qpc{0};
 static std::atomic_uint64_t g_predisplay_call_count{0};
 static std::atomic_uint64_t g_predisplay_zero_count{0};
 static std::atomic_uint64_t g_predisplay_request_count{0};
-static std::atomic_uint64_t g_blur_call_request_count{0};
-static std::atomic_uint64_t g_last_zero_request_call{0};
+static std::atomic_uint64_t g_last_zero_predisplay_call{0};
+static std::atomic_uint64_t g_last_fallback_token_call{0};
+static std::atomic_uint32_t g_scene_token_counter{0};
+static std::atomic_uint32_t g_scene_token_active{0};
+static std::atomic_bool g_precip_state_initialized{false};
+static std::atomic_uint32_t g_precip_signature_last{0};
+static std::atomic_uint32_t g_precip_signature_candidate{0};
+static std::atomic_uint32_t g_precip_signature_streak{0};
+static std::atomic_bool g_overlay_state_initialized{false};
+static std::atomic_uint32_t g_overlay_state_last{0};
+static std::atomic_uint64_t g_scene_pair_skip_count{0};
+static std::atomic_uint64_t g_prehud_token_emit_count{0};
+static std::atomic_uint64_t g_last_token_emit_qpc{0};
 static std::mutex g_capture_mutex;
 static std::atomic_bool g_enable_capture{false};
-static std::atomic_bool g_mw_precip_state_initialized{false};
-static std::atomic_uint32_t g_mw_precip_signature_last{0};
-static std::atomic_uint32_t g_mw_precip_signature_candidate{0};
-static std::atomic_uint32_t g_mw_precip_signature_streak{0};
-static std::atomic_uint64_t g_mw_precip_last_emit_call{0};
 
 static IDirect3DSurface9 *g_sysmem_surface = nullptr;
 static D3DFORMAT g_sysmem_format = D3DFMT_UNKNOWN;
 static unsigned int g_sysmem_w = 0, g_sysmem_h = 0;
+
+static uint32_t read_overlay_state_flag()
+{
+#if GAME_MW
+	constexpr uintptr_t k_draw_feng_bool_addr = 0x008F374C;
+	__try
+	{
+		return (*reinterpret_cast<volatile uint32_t *>(k_draw_feng_bool_addr) != 0) ? 1u : 0u;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return 0u;
+	}
+#else
+	return 0u;
+#endif
+}
+
+static bool try_resolve_exports();
+
+static void *read_ptr_safe(uintptr_t addr)
+{
+	__try
+	{
+		return *reinterpret_cast<void **>(addr);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return nullptr;
+	}
+}
+
+static bool is_canonical_scene_pair_bound(IDirect3DDevice9 *dev)
+{
+#if GAME_MW
+	if (dev == nullptr)
+		return false;
+
+	// IDA-validated canonical scene surfaces used by sub_6E6E40/sub_6D0EA0/sub_6DB011/sub_6DC232:
+	// SetRenderTarget(0, dword_93DAC0) + SetDepthStencilSurface(dword_93DAC4).
+	constexpr uintptr_t k_scene_rt_addr = 0x0093DAC0;
+	constexpr uintptr_t k_scene_ds_addr = 0x0093DAC4;
+	IDirect3DSurface9 *const expected_rt = reinterpret_cast<IDirect3DSurface9 *>(read_ptr_safe(k_scene_rt_addr));
+	IDirect3DSurface9 *const expected_ds = reinterpret_cast<IDirect3DSurface9 *>(read_ptr_safe(k_scene_ds_addr));
+	if (expected_rt == nullptr || expected_ds == nullptr)
+		return false;
+
+	IDirect3DSurface9 *cur_rt = nullptr;
+	IDirect3DSurface9 *cur_ds = nullptr;
+	const HRESULT hr_rt = dev->GetRenderTarget(0, &cur_rt);
+	const HRESULT hr_ds = dev->GetDepthStencilSurface(&cur_ds);
+	const bool ok = SUCCEEDED(hr_rt) && SUCCEEDED(hr_ds) && cur_rt == expected_rt && cur_ds == expected_ds;
+	if (cur_rt)
+		cur_rt->Release();
+	if (cur_ds)
+		cur_ds->Release();
+	return ok;
+#else
+	(void)dev;
+	return true;
+#endif
+}
+
+static bool emit_prehud_token_window(const char *origin_tag, bool require_canonical_scene_pair)
+{
+	if (!try_resolve_exports())
+		return false;
+
+	// Dedupe burst emits from the same frame/phase path (can happen around FE transitions).
+	// Keep nominal 60-144 FPS unaffected while blocking sub-millisecond duplicates.
+	LARGE_INTEGER freq = {}, now = {};
+	if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&now) && freq.QuadPart > 0)
+	{
+		const uint64_t now_qpc = static_cast<uint64_t>(now.QuadPart);
+		const uint64_t prev_qpc = g_last_token_emit_qpc.load(std::memory_order_relaxed);
+		const uint64_t min_delta = static_cast<uint64_t>(freq.QuadPart / 220); // ~4.5ms
+		if (prev_qpc != 0 && now_qpc > prev_qpc && (now_qpc - prev_qpc) < min_delta)
+			return false;
+		g_last_token_emit_qpc.store(now_qpc, std::memory_order_relaxed);
+	}
+
+	IDirect3DDevice9 *dev = *reinterpret_cast<IDirect3DDevice9 **>(NFS_D3D9_DEVICE_ADDRESS);
+	if (require_canonical_scene_pair && !is_canonical_scene_pair_bound(dev))
+	{
+		const uint64_t skips = g_scene_pair_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (skips <= 5 || (skips % 120) == 0)
+		{
+			char msg[192] = {};
+			sprintf_s(msg, "NFS_Addon_Bridge: Skip token (%s): canonical scene RT/DS not bound.\n", origin_tag ? origin_tag : "?");
+			OutputDebugStringA(msg);
+		}
+		return false;
+	}
+
+	const uint32_t token = g_scene_token_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	g_scene_token_active.store(token, std::memory_order_relaxed);
+	if (g_pfnBeginPreHudWindow)
+		g_pfnBeginPreHudWindow(token);
+	if (g_pfnRequestPreHudEffects)
+	{
+		g_pfnRequestPreHudEffects();
+		g_predisplay_request_count.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (g_pfnEndPreHudWindow)
+		g_pfnEndPreHudWindow(token);
+	g_scene_token_active.store(0, std::memory_order_relaxed);
+	const uint64_t emits = g_prehud_token_emit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (emits <= 5 || (emits % 120) == 0)
+	{
+		char msg[192] = {};
+		sprintf_s(msg, "NFS_Addon_Bridge: Emitted pre-HUD token (src=%s token=%u emits=%llu).\n",
+			origin_tag ? origin_tag : "?", token, static_cast<unsigned long long>(emits));
+		OutputDebugStringA(msg);
+	}
+	return true;
+}
 
 static bool try_resolve_exports()
 {
@@ -62,8 +189,11 @@ static bool try_resolve_exports()
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(h, "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(h, "NFSTweak_PushDepthSurface"));
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(h, "NFSTweak_RequestPreHudEffects"));
+		g_pfnBeginPreHudWindow = reinterpret_cast<PFN_NFSTweak_BeginPreHudWindow>(GetProcAddress(h, "NFSTweak_BeginPreHudWindow"));
+		g_pfnEndPreHudWindow = reinterpret_cast<PFN_NFSTweak_EndPreHudWindow>(GetProcAddress(h, "NFSTweak_EndPreHudWindow"));
 		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(h, "NFSTweak_NotifyPrecipitationChanged"));
-		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnNotifyPrecipitationChanged);
+		g_pfnNotifyPhaseInvalidate = reinterpret_cast<PFN_NFSTweak_NotifyPhaseInvalidate>(GetProcAddress(h, "NFSTweak_NotifyPhaseInvalidate"));
+		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnBeginPreHudWindow || g_pfnEndPreHudWindow || g_pfnNotifyPrecipitationChanged || g_pfnNotifyPhaseInvalidate);
 	}
 
 	// Scan modules (robust against renamed addon file)
@@ -81,20 +211,28 @@ static bool try_resolve_exports()
 		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects");
 		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_BeginPreHudWindow");
+		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_EndPreHudWindow");
+		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged");
+		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_NotifyPhaseInvalidate");
 		if (!p)
 			continue;
 
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(modules[i], "NFSTweak_PushDepthBufferR32F"));
 		g_pfnPushDepthSurface = reinterpret_cast<PFN_NFSTweak_PushDepthSurface>(GetProcAddress(modules[i], "NFSTweak_PushDepthSurface"));
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects"));
+		g_pfnBeginPreHudWindow = reinterpret_cast<PFN_NFSTweak_BeginPreHudWindow>(GetProcAddress(modules[i], "NFSTweak_BeginPreHudWindow"));
+		g_pfnEndPreHudWindow = reinterpret_cast<PFN_NFSTweak_EndPreHudWindow>(GetProcAddress(modules[i], "NFSTweak_EndPreHudWindow"));
 		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged"));
+		g_pfnNotifyPhaseInvalidate = reinterpret_cast<PFN_NFSTweak_NotifyPhaseInvalidate>(GetProcAddress(modules[i], "NFSTweak_NotifyPhaseInvalidate"));
 		return true;
 	}
 
 	return false;
 }
-
 
 static bool throttle_capture(uint32_t hz)
 {
@@ -246,72 +384,95 @@ static void pump_precipitation_signal_from_hooks()
 	if (!try_resolve_exports() || g_pfnNotifyPrecipitationChanged == nullptr)
 		return;
 
-	// Bridge-owned precipitation state source (addon does not poll these addresses).
-	// Use render-flag edge detection with asymmetric debounce:
-	// fast ON detection, conservative OFF detection to avoid false unlocks.
-	uint32_t cur_render = 0;
-	cur_render = *reinterpret_cast<volatile uint32_t *>(PRECIPITATION_DEBUG_ADDR);
-
-	const uint64_t call_now = g_predisplay_call_count.load(std::memory_order_relaxed);
-	const uint32_t signature = (cur_render != 0) ? 0x02u : 0x00u;
-
-	const uint64_t last_emit_call = g_mw_precip_last_emit_call.load(std::memory_order_relaxed);
-	constexpr uint64_t k_emit_cooldown_calls = 45;
-	const bool cooldown_ok = (call_now >= last_emit_call) && ((call_now - last_emit_call) >= k_emit_cooldown_calls);
-	constexpr uint32_t k_streak_on_needed = 3;
-	constexpr uint32_t k_streak_off_needed = 24;
-
-	if (!g_mw_precip_state_initialized.load(std::memory_order_relaxed))
+	const uint32_t cur = (*reinterpret_cast<volatile uint32_t *>(PRECIPITATION_DEBUG_ADDR) != 0) ? 0x02u : 0x00u;
+	if (!g_precip_state_initialized.load(std::memory_order_relaxed))
 	{
-		g_mw_precip_state_initialized.store(true, std::memory_order_relaxed);
-		g_mw_precip_signature_last.store(signature, std::memory_order_relaxed);
-		g_mw_precip_signature_candidate.store(signature, std::memory_order_relaxed);
-		g_mw_precip_signature_streak.store(0, std::memory_order_relaxed);
-		g_mw_precip_last_emit_call.store(call_now, std::memory_order_relaxed);
-		g_pfnNotifyPrecipitationChanged(signature);
+		g_precip_state_initialized.store(true, std::memory_order_relaxed);
+		g_precip_signature_last.store(cur, std::memory_order_relaxed);
+		g_precip_signature_candidate.store(cur, std::memory_order_relaxed);
+		g_precip_signature_streak.store(0, std::memory_order_relaxed);
+		g_pfnNotifyPrecipitationChanged(cur);
 		return;
 	}
 
-	const uint32_t committed = g_mw_precip_signature_last.load(std::memory_order_relaxed);
-	if (signature == committed)
+	const uint32_t committed = g_precip_signature_last.load(std::memory_order_relaxed);
+	if (cur == committed)
 	{
-		g_mw_precip_signature_candidate.store(signature, std::memory_order_relaxed);
-		g_mw_precip_signature_streak.store(0, std::memory_order_relaxed);
+		g_precip_signature_candidate.store(cur, std::memory_order_relaxed);
+		g_precip_signature_streak.store(0, std::memory_order_relaxed);
 		return;
 	}
 
-	uint32_t candidate = g_mw_precip_signature_candidate.load(std::memory_order_relaxed);
-	uint32_t streak = g_mw_precip_signature_streak.load(std::memory_order_relaxed);
-	if (candidate != signature)
+	uint32_t candidate = g_precip_signature_candidate.load(std::memory_order_relaxed);
+	uint32_t streak = g_precip_signature_streak.load(std::memory_order_relaxed);
+	if (candidate != cur)
 	{
-		candidate = signature;
+		candidate = cur;
 		streak = 1;
 	}
 	else
 	{
-		streak += 1;
+		++streak;
 	}
-	g_mw_precip_signature_candidate.store(candidate, std::memory_order_relaxed);
-	g_mw_precip_signature_streak.store(streak, std::memory_order_relaxed);
+	g_precip_signature_candidate.store(candidate, std::memory_order_relaxed);
+	g_precip_signature_streak.store(streak, std::memory_order_relaxed);
 
-	const uint32_t needed = (signature != 0) ? k_streak_on_needed : k_streak_off_needed;
-	if (streak >= needed && cooldown_ok)
+	const uint32_t needed = (cur != 0) ? 3u : 18u;
+	if (streak >= needed)
 	{
-		g_mw_precip_signature_last.store(signature, std::memory_order_relaxed);
-		g_mw_precip_signature_streak.store(0, std::memory_order_relaxed);
-		g_mw_precip_last_emit_call.store(call_now, std::memory_order_relaxed);
-		g_pfnNotifyPrecipitationChanged(signature);
+		g_precip_signature_last.store(cur, std::memory_order_relaxed);
+		g_precip_signature_streak.store(0, std::memory_order_relaxed);
+		g_pfnNotifyPrecipitationChanged(cur);
 	}
+#endif
+}
+
+static void pump_overlay_invalidate_signal()
+{
+#if GAME_MW
+	if (!try_resolve_exports() || g_pfnNotifyPhaseInvalidate == nullptr)
+		return;
+
+	const uint32_t cur = read_overlay_state_flag();
+	if (!g_overlay_state_initialized.load(std::memory_order_relaxed))
+	{
+		g_overlay_state_initialized.store(true, std::memory_order_relaxed);
+		g_overlay_state_last.store(cur, std::memory_order_relaxed);
+		return;
+	}
+
+	const uint32_t prev = g_overlay_state_last.load(std::memory_order_relaxed);
+	if (cur == prev)
+		return;
+
+	g_overlay_state_last.store(cur, std::memory_order_relaxed);
+	// reason: 1=overlay_enter, 2=overlay_exit
+	g_pfnNotifyPhaseInvalidate(cur ? 1u : 2u);
 #endif
 }
 
 // The original FEManager_Render function pointer
 void(__thiscall *FEManager_Render_orig)(unsigned int thisptr) = (void(__thiscall *)(unsigned int))FEMANAGER_RENDER_ADDRESS;
 int(__cdecl *PreDisplay_Render_orig)(int a1) = (int(__cdecl *)(int))PREDISPLAY_RENDER_ADDRESS;
+static int(__thiscall *MW_Sub516F70_orig)(void *self) = (int(__thiscall *)(void *))0x00516F70;
+
+int __fastcall MW_Sub516F70_Hook(void *self, void *)
+{
 #if GAME_MW
-static int(__cdecl *MW_BlurPass_orig)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t) =
-	(int(__cdecl *)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))0x006D3B80;
+	(void)self;
+	__try
+	{
+		// Deterministic pre-HUD request point from IDA:
+		// sub_6E6E40 + 0x390 calls sub_516F70 right before FE/HUD rendering.
+		emit_prehud_token_window("sub_516F70", true);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		OutputDebugStringA("NFS_Addon_Bridge: MW_Sub516F70_Hook token emit exception suppressed.\n");
+	}
 #endif
+	return MW_Sub516F70_orig(self);
+}
 
 void __stdcall FEManager_Render_Hook()
 {
@@ -322,7 +483,8 @@ void __stdcall FEManager_Render_Hook()
 #endif
 
 #if GAME_MW
-	// Resolve exports for depth/capture paths.
+	// Always try to resolve exports from the addon at this hook point.
+	// This keeps bridge->addon communication available for depth/capture paths.
 	try_resolve_exports();
 
 	IDirect3DDevice9 *dev = *(IDirect3DDevice9 **)NFS_D3D9_DEVICE_ADDRESS;
@@ -335,58 +497,27 @@ void __stdcall FEManager_Render_Hook()
 int __cdecl PreDisplay_Render_Hook(int a1)
 {
 #if GAME_MW
-	g_predisplay_call_count.fetch_add(1);
-	// IMPORTANT: sub_6E6E40(0) performs device SetRenderTarget/SetDepthStencilSurface calls
-	// (IDA: call [ecx+94h] @ 0x6E6E6B, call [ecx+9Ch] @ 0x6E6E80).
-	// So execute original first, then request pre-HUD so addon sees the updated RT/DS state.
+	const uint64_t call_now = g_predisplay_call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+	pump_precipitation_signal_from_hooks();
+	pump_overlay_invalidate_signal();
 	const int ret = PreDisplay_Render_orig(a1);
-	__try
+	// Trigger exactly on sub_6E6E40(0), which is the second display-phase call in eDisplayFrame.
+	// This is a stronger pre-HUD boundary than FEManager::Render helper internals.
+	if (a1 == 0)
 	{
-		const uint64_t call_now = g_predisplay_call_count.load(std::memory_order_relaxed);
-		const bool is_primary_prehud = (a1 == 0);
-		if (is_primary_prehud)
-			g_predisplay_zero_count.fetch_add(1);
-		try_resolve_exports();
-		pump_precipitation_signal_from_hooks();
-		if (g_pfnRequestPreHudEffects && is_primary_prehud)
-		{
-			g_pfnRequestPreHudEffects();
-			g_predisplay_request_count.fetch_add(1);
-			g_last_zero_request_call.store(call_now, std::memory_order_relaxed);
-		}
-		else if (g_pfnRequestPreHudEffects)
-		{
-			// Guarded fallback: some transitions stop producing a1==0 for a while.
-			// Emit a sparse signal so add-on can recover, without flooding wrong phases.
-			const uint64_t last_zero = g_last_zero_request_call.load(std::memory_order_relaxed);
-			if (last_zero != 0 && call_now > last_zero && (call_now - last_zero) >= 240)
-			{
-				g_pfnRequestPreHudEffects();
-				g_predisplay_request_count.fetch_add(1);
-				g_last_zero_request_call.store(call_now, std::memory_order_relaxed);
-			}
-		}
+		g_predisplay_zero_count.fetch_add(1);
+		g_last_zero_predisplay_call.store(call_now, std::memory_order_relaxed);
+		// Deterministic mode: token emission is anchored at sub_516F70 hook point.
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+	else
 	{
-		OutputDebugStringA("NFS_Addon_Bridge: PreDisplay_Render_Hook exception suppressed.\n");
+		// Deterministic mode: no fallback token emission from non-canonical display phases.
+		// Tokens are emitted only from a1==0 when canonical scene RT/DS is bound.
 	}
 	return ret;
 #endif
 	return PreDisplay_Render_orig(a1);
 }
-
-#if GAME_MW
-int __cdecl MW_BlurPass_Hook(
-	uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
-	uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8)
-{
-	const int ret = MW_BlurPass_orig(a1, a2, a3, a4, a5, a6, a7, a8);
-	(void)a5; (void)a6; (void)a7; (void)a8;
-
-	return ret;
-}
-#endif
 
 // Provide a stub for optional hook symbol when headers declare it but no TU defines it in this build.
 #if defined(HAS_COPS) && !defined(GAME_UC)
@@ -416,8 +547,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 				injector::MakeCALL(PREDISPLAY_HOOKADDR1, PreDisplay_Render_Hook, true);
 				injector::MakeCALL(PREDISPLAY_HOOKADDR2, PreDisplay_Render_Hook, true);
 #ifdef GAME_MW
-				injector::MakeCALL(0x006DBE8B, MW_BlurPass_Hook, true);
-				injector::MakeCALL(0x006DBEB0, MW_BlurPass_Hook, true);
+				// End pre-HUD token window exactly at FE/HUD callsite in eDisplayFrame.
+				injector::MakeCALL(0x006E71D0, MW_Sub516F70_Hook, true);
 #endif
 #endif
 
