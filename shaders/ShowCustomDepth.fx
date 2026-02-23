@@ -6,7 +6,7 @@
 texture BackBufferTex : COLOR;
 sampler sColor { Texture = BackBufferTex; };
 
-// Bind from addon via runtime->update_texture_bindings("CUSTOMDEPTH", ...).
+// Debug source: enable "Debug mirror to CUSTOMDEPTH (ShowCustomDepth.fx)" in NFSTweakBridge menu.
 texture CustomDepthTex : CUSTOMDEPTH;
 sampler sDepth { Texture = CustomDepthTex; };
 
@@ -16,8 +16,8 @@ uniform float HazeEnd      = 0.95;  // full haze
 uniform float HazeStrength = 0.35;  // blend amount
 uniform float HazeBias     = 2.0;
 //uniform float3 HazeColor   = float3(0.88, 0.8, 0.4);  // piss filter
-//uniform float3 HazeColor = float3(0.62, 0.64, 0.58);    // SH1
-uniform float3 HazeColor = float3(0.68, 0.67, 0.61);    // SH2 outdoor daytime
+uniform float3 HazeColor = float3(0.62, 0.64, 0.58);    // SH1
+//uniform float3 HazeColor = float3(0.68, 0.67, 0.61);    // SH2 outdoor daytime
 //uniform float3 HazeColor = float3(0.58, 0.60, 0.59);    // Silent Hill 3 (more neutral gray)
 //uniform float3 HazeColor = float3(0.52, 0.55, 0.53);    // Silent Hill heavy fog / dense haze
 
@@ -27,7 +27,7 @@ float4 VS_Fullscreen(uint id : SV_VertexID, out float2 uv : TEXCOORD) : SV_Posit
     return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 }
 
-float4 PS_RawDepth_CompressWhite_Haze(float4 pos : SV_Position, float2 uv : TexCoord) : SV_Target
+float4 PS_RawDepth_CompressWhite_Haze(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     float d = tex2D(sDepth, uv).r;
 

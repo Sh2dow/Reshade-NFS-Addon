@@ -13,6 +13,7 @@
 #include <d3d9.h>
 #include <algorithm>
 #include <string>
+#include <fstream>
 #include <atomic>
 #include <mutex>
 #include <vector>

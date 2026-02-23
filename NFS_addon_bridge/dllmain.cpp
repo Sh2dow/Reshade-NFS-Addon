@@ -26,16 +26,22 @@ using PFN_NFSTweak_PushDepthBufferR32F = void(__cdecl *)(const void *data, unsig
 using PFN_NFSTweak_RequestPreHudEffects = void(__cdecl *)();
 using PFN_NFSTweak_BeginPreHudWindow = void(__cdecl *)(unsigned int token);
 using PFN_NFSTweak_EndPreHudWindow = void(__cdecl *)(unsigned int token);
+using PFN_NFSTweak_BeginPreHudWindowEx = void(__cdecl *)(unsigned int token, unsigned int epoch);
+using PFN_NFSTweak_EndPreHudWindowEx = void(__cdecl *)(unsigned int token, unsigned int epoch);
 using PFN_NFSTweak_NotifyPrecipitationChanged = void(__cdecl *)(unsigned int value);
 using PFN_NFSTweak_NotifyPhaseInvalidate = void(__cdecl *)(unsigned int reason);
+using PFN_NFSTweak_NotifyPhaseInvalidateEx = void(__cdecl *)(unsigned int reason, unsigned int epoch);
 
 static PFN_NFSTweak_PushDepthSurface g_pfnPushDepthSurface = nullptr;
 static PFN_NFSTweak_PushDepthBufferR32F g_pfnPushDepthBufferR32F = nullptr;
 static PFN_NFSTweak_RequestPreHudEffects g_pfnRequestPreHudEffects = nullptr;
 static PFN_NFSTweak_BeginPreHudWindow g_pfnBeginPreHudWindow = nullptr;
 static PFN_NFSTweak_EndPreHudWindow g_pfnEndPreHudWindow = nullptr;
+static PFN_NFSTweak_BeginPreHudWindowEx g_pfnBeginPreHudWindowEx = nullptr;
+static PFN_NFSTweak_EndPreHudWindowEx g_pfnEndPreHudWindowEx = nullptr;
 static PFN_NFSTweak_NotifyPrecipitationChanged g_pfnNotifyPrecipitationChanged = nullptr;
 static PFN_NFSTweak_NotifyPhaseInvalidate g_pfnNotifyPhaseInvalidate = nullptr;
+static PFN_NFSTweak_NotifyPhaseInvalidateEx g_pfnNotifyPhaseInvalidateEx = nullptr;
 
 static std::atomic_uint64_t g_last_capture_qpc{0};
 static std::atomic_uint64_t g_predisplay_call_count{0};
@@ -45,6 +51,7 @@ static std::atomic_uint64_t g_last_zero_predisplay_call{0};
 static std::atomic_uint64_t g_last_fallback_token_call{0};
 static std::atomic_uint32_t g_scene_token_counter{0};
 static std::atomic_uint32_t g_scene_token_active{0};
+static std::atomic_uint32_t g_bridge_phase_epoch{1};
 static std::atomic_bool g_precip_state_initialized{false};
 static std::atomic_uint32_t g_precip_signature_last{0};
 static std::atomic_uint32_t g_precip_signature_candidate{0};
@@ -155,15 +162,20 @@ static bool emit_prehud_token_window(const char *origin_tag, bool require_canoni
 	}
 
 	const uint32_t token = g_scene_token_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint32_t epoch = g_bridge_phase_epoch.load(std::memory_order_relaxed);
 	g_scene_token_active.store(token, std::memory_order_relaxed);
-	if (g_pfnBeginPreHudWindow)
+	if (g_pfnBeginPreHudWindowEx)
+		g_pfnBeginPreHudWindowEx(token, epoch);
+	else if (g_pfnBeginPreHudWindow)
 		g_pfnBeginPreHudWindow(token);
 	if (g_pfnRequestPreHudEffects)
 	{
 		g_pfnRequestPreHudEffects();
 		g_predisplay_request_count.fetch_add(1, std::memory_order_relaxed);
 	}
-	if (g_pfnEndPreHudWindow)
+	if (g_pfnEndPreHudWindowEx)
+		g_pfnEndPreHudWindowEx(token, epoch);
+	else if (g_pfnEndPreHudWindow)
 		g_pfnEndPreHudWindow(token);
 	g_scene_token_active.store(0, std::memory_order_relaxed);
 	const uint64_t emits = g_prehud_token_emit_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -191,9 +203,12 @@ static bool try_resolve_exports()
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(h, "NFSTweak_RequestPreHudEffects"));
 		g_pfnBeginPreHudWindow = reinterpret_cast<PFN_NFSTweak_BeginPreHudWindow>(GetProcAddress(h, "NFSTweak_BeginPreHudWindow"));
 		g_pfnEndPreHudWindow = reinterpret_cast<PFN_NFSTweak_EndPreHudWindow>(GetProcAddress(h, "NFSTweak_EndPreHudWindow"));
+		g_pfnBeginPreHudWindowEx = reinterpret_cast<PFN_NFSTweak_BeginPreHudWindowEx>(GetProcAddress(h, "NFSTweak_BeginPreHudWindowEx"));
+		g_pfnEndPreHudWindowEx = reinterpret_cast<PFN_NFSTweak_EndPreHudWindowEx>(GetProcAddress(h, "NFSTweak_EndPreHudWindowEx"));
 		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(h, "NFSTweak_NotifyPrecipitationChanged"));
 		g_pfnNotifyPhaseInvalidate = reinterpret_cast<PFN_NFSTweak_NotifyPhaseInvalidate>(GetProcAddress(h, "NFSTweak_NotifyPhaseInvalidate"));
-		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnBeginPreHudWindow || g_pfnEndPreHudWindow || g_pfnNotifyPrecipitationChanged || g_pfnNotifyPhaseInvalidate);
+		g_pfnNotifyPhaseInvalidateEx = reinterpret_cast<PFN_NFSTweak_NotifyPhaseInvalidateEx>(GetProcAddress(h, "NFSTweak_NotifyPhaseInvalidateEx"));
+		return (g_pfnPushDepthBufferR32F || g_pfnPushDepthSurface || g_pfnRequestPreHudEffects || g_pfnBeginPreHudWindow || g_pfnEndPreHudWindow || g_pfnBeginPreHudWindowEx || g_pfnEndPreHudWindowEx || g_pfnNotifyPrecipitationChanged || g_pfnNotifyPhaseInvalidate || g_pfnNotifyPhaseInvalidateEx);
 	}
 
 	// Scan modules (robust against renamed addon file)
@@ -219,6 +234,12 @@ static bool try_resolve_exports()
 		if (!p)
 			p = GetProcAddress(modules[i], "NFSTweak_NotifyPhaseInvalidate");
 		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_BeginPreHudWindowEx");
+		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_EndPreHudWindowEx");
+		if (!p)
+			p = GetProcAddress(modules[i], "NFSTweak_NotifyPhaseInvalidateEx");
+		if (!p)
 			continue;
 
 		g_pfnPushDepthBufferR32F = reinterpret_cast<PFN_NFSTweak_PushDepthBufferR32F>(GetProcAddress(modules[i], "NFSTweak_PushDepthBufferR32F"));
@@ -226,8 +247,11 @@ static bool try_resolve_exports()
 		g_pfnRequestPreHudEffects = reinterpret_cast<PFN_NFSTweak_RequestPreHudEffects>(GetProcAddress(modules[i], "NFSTweak_RequestPreHudEffects"));
 		g_pfnBeginPreHudWindow = reinterpret_cast<PFN_NFSTweak_BeginPreHudWindow>(GetProcAddress(modules[i], "NFSTweak_BeginPreHudWindow"));
 		g_pfnEndPreHudWindow = reinterpret_cast<PFN_NFSTweak_EndPreHudWindow>(GetProcAddress(modules[i], "NFSTweak_EndPreHudWindow"));
+		g_pfnBeginPreHudWindowEx = reinterpret_cast<PFN_NFSTweak_BeginPreHudWindowEx>(GetProcAddress(modules[i], "NFSTweak_BeginPreHudWindowEx"));
+		g_pfnEndPreHudWindowEx = reinterpret_cast<PFN_NFSTweak_EndPreHudWindowEx>(GetProcAddress(modules[i], "NFSTweak_EndPreHudWindowEx"));
 		g_pfnNotifyPrecipitationChanged = reinterpret_cast<PFN_NFSTweak_NotifyPrecipitationChanged>(GetProcAddress(modules[i], "NFSTweak_NotifyPrecipitationChanged"));
 		g_pfnNotifyPhaseInvalidate = reinterpret_cast<PFN_NFSTweak_NotifyPhaseInvalidate>(GetProcAddress(modules[i], "NFSTweak_NotifyPhaseInvalidate"));
+		g_pfnNotifyPhaseInvalidateEx = reinterpret_cast<PFN_NFSTweak_NotifyPhaseInvalidateEx>(GetProcAddress(modules[i], "NFSTweak_NotifyPhaseInvalidateEx"));
 		return true;
 	}
 
@@ -430,7 +454,7 @@ static void pump_precipitation_signal_from_hooks()
 static void pump_overlay_invalidate_signal()
 {
 #if GAME_MW
-	if (!try_resolve_exports() || g_pfnNotifyPhaseInvalidate == nullptr)
+	if (!try_resolve_exports())
 		return;
 
 	const uint32_t cur = read_overlay_state_flag();
@@ -447,7 +471,11 @@ static void pump_overlay_invalidate_signal()
 
 	g_overlay_state_last.store(cur, std::memory_order_relaxed);
 	// reason: 1=overlay_enter, 2=overlay_exit
-	g_pfnNotifyPhaseInvalidate(cur ? 1u : 2u);
+	const uint32_t next_epoch = g_bridge_phase_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (g_pfnNotifyPhaseInvalidateEx)
+		g_pfnNotifyPhaseInvalidateEx(cur ? 1u : 2u, next_epoch);
+	else if (g_pfnNotifyPhaseInvalidate)
+		g_pfnNotifyPhaseInvalidate(cur ? 1u : 2u);
 #endif
 }
 

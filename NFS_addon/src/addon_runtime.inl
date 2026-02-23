@@ -1,3 +1,96 @@
+static constexpr bool k_enable_prehud_trace = true;
+static constexpr bool k_sample_render_trace = false;
+
+static void prehud_trace_push(uint32_t kind, uint64_t frame, uint64_t bp, uint64_t rtv, uint64_t dsv, uint32_t score, uint32_t token, uint32_t reason)
+{
+    if (!k_enable_prehud_trace)
+        return;
+    // Optional sampling for high-frequency render events.
+    // Diagnostics build can disable this to capture every preHUD render.
+    if (k_sample_render_trace && kind == 1 && (frame % 4) != 0)
+        return;
+    const uint32_t pos = g_prehud_trace_write.fetch_add(1, std::memory_order_relaxed);
+    prehud_trace_entry &e = g_prehud_trace[pos % k_prehud_trace_capacity];
+    e.kind = kind;
+    e.frame = frame;
+    e.bp = bp;
+    e.rtv = rtv;
+    e.dsv = dsv;
+    e.score = score;
+    e.token = token;
+    e.reason = reason;
+}
+
+static void prehud_trace_dump(uint32_t max_entries)
+{
+    if (!k_enable_prehud_trace)
+        return;
+    const uint32_t write = g_prehud_trace_write.load(std::memory_order_relaxed);
+    const uint32_t available = (write < k_prehud_trace_capacity) ? write : k_prehud_trace_capacity;
+    const uint32_t count = (max_entries < available) ? max_entries : available;
+    char exe_path[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    std::string dump_path = "NFSTweakBridge_TraceDump.log";
+    if (n > 0 && n < MAX_PATH)
+    {
+        std::string exe(exe_path, n);
+        const size_t slash = exe.find_last_of("\\/");
+        if (slash != std::string::npos)
+            dump_path = exe.substr(0, slash + 1) + "NFSTweakBridge_TraceDump.log";
+    }
+
+    std::ofstream out(dump_path.c_str(), std::ios::out | std::ios::trunc);
+    if (!out.is_open())
+    {
+        char msg[320] = {};
+        sprintf_s(msg, "NFSTweakBridge: TRACE DUMP failed to open '%s' (err=%lu)\n", dump_path.c_str(), GetLastError());
+        log_info(msg);
+        return;
+    }
+
+    out << "NFSTweakBridge TRACE DUMP begin (entries=" << count << ", write=" << write << ")\n";
+    if (count == 0)
+    {
+        out << "NFSTweakBridge TRACE DUMP empty\n";
+    }
+    else
+    {
+        const uint32_t start = write - count;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const prehud_trace_entry &e = g_prehud_trace[(start + i) % k_prehud_trace_capacity];
+            out << "NFSTrace: kind=" << e.kind
+                << " frame=" << static_cast<unsigned long long>(e.frame)
+                << " bp=" << static_cast<unsigned long long>(e.bp)
+                << " token=" << e.token
+                << " rtv=" << static_cast<unsigned long long>(e.rtv)
+                << " dsv=" << static_cast<unsigned long long>(e.dsv)
+                << " score=" << e.score
+                << " reason=0x" << std::hex << std::uppercase << e.reason << std::dec << "\n";
+        }
+    }
+    out << "NFSTweakBridge TRACE DUMP end\n";
+    out.flush();
+    out.close();
+
+    char ok_msg[320] = {};
+    sprintf_s(ok_msg, "NFSTweakBridge: TRACE DUMP wrote '%s' (entries=%u)\n", dump_path.c_str(), count);
+    log_info(ok_msg);
+}
+
+static constexpr const char *k_runtime_depth_semantic = "NFSTWEAK_DEPTH";
+static constexpr const char *k_debug_customdepth_semantic = "CUSTOMDEPTH";
+
+static void bind_runtime_depth_view(resource_view view)
+{
+    if (!g_runtime || view.handle == 0)
+        return;
+
+    g_runtime->update_texture_bindings(k_runtime_depth_semantic, view, view);
+    if (g_mirror_customdepth_debug.load(std::memory_order_relaxed))
+        g_runtime->update_texture_bindings(k_debug_customdepth_semantic, view, view);
+}
+
 static void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uint32_t count, const resource_view *rtvs, resource_view dsv)
 {
     if (!g_runtime_alive.load(std::memory_order_relaxed))
@@ -103,6 +196,7 @@ static void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uin
             const bool token_not_rendered = token != 0 && g_scene_window_rendered_token.load(std::memory_order_relaxed) != token;
             const bool wants_prehud = g_request_pre_hud_effects.load(std::memory_order_relaxed);
             const uint64_t last_manual_frame = g_last_manual_prehud_frame.load(std::memory_order_relaxed);
+            const bool manual_latch_free = g_manual_render_latch_frame.load(std::memory_order_relaxed) != frame;
 
             const bool locked_pair_pass_bind =
                 g_prehud_locked_rt_resource.handle != 0 &&
@@ -120,6 +214,7 @@ static void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uin
                 token_not_rendered &&
                 request_in_tight_window &&
                 last_manual_frame != frame &&
+                manual_latch_free &&
                 !g_pre_hud_effects_issued_this_frame.load(std::memory_order_relaxed) &&
                 g_skip_manual_prehud_frames.load() <= 0 &&
                 !g_running_manual_effects.exchange(true))
@@ -144,9 +239,16 @@ static void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uin
                 g_running_manual_effects.store(false, std::memory_order_relaxed);
                 if (render_ok)
                 {
+                    g_manual_render_latch_frame.store(frame, std::memory_order_relaxed);
                     g_last_manual_prehud_frame.store(frame, std::memory_order_relaxed);
                     g_pre_hud_effects_issued_this_frame.store(true, std::memory_order_relaxed);
+                    g_diag_last_prehud_rtv.store(static_cast<uint64_t>(prehud_rtv_resource.handle), std::memory_order_relaxed);
+                    g_diag_last_prehud_dsv.store(static_cast<uint64_t>(prehud_dsv_resource.handle), std::memory_order_relaxed);
                     g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
+                    prehud_trace_push(1, frame, g_beginpass_counter.load(std::memory_order_relaxed),
+                        static_cast<uint64_t>(prehud_rtv_resource.handle),
+                        static_cast<uint64_t>(prehud_dsv_resource.handle),
+                        score, token, 0);
                     g_scene_window_rendered_token.store(token, std::memory_order_relaxed);
                     g_scene_window_open.store(false, std::memory_order_relaxed);
                     g_scene_window_close_pending.store(false, std::memory_order_relaxed);
@@ -258,8 +360,8 @@ static void bind_vulkan_candidate_if_good()
         g_vulkan_depth_resolved_w == bb_w && g_vulkan_depth_resolved_h == bb_h &&
         g_vulkan_depth_resolved_format == g_vulkan_depth_candidate_format)
     {
-        g_runtime->update_texture_bindings("CUSTOMDEPTH", g_vulkan_depth_resolved_srv, g_vulkan_depth_resolved_srv);
-        log_info("NFSTweakBridge: Bound RESOLVED Vulkan depth buffer as CUSTOMDEPTH.\n");
+        bind_runtime_depth_view(g_vulkan_depth_resolved_srv);
+        log_info("NFSTweakBridge: Bound RESOLVED Vulkan depth buffer as NFSTWEAK_DEPTH.\n");
         g_vulkan_depth_last_score = g_vulkan_depth_candidate_score;
 
         g_vulkan_depth_candidate_dsv = { 0 };
@@ -287,8 +389,8 @@ static void bind_vulkan_candidate_if_good()
 
     g_runtime_depth_srv = srv;
     g_runtime_depth_resource = g_vulkan_depth_candidate_res;
-    g_runtime->update_texture_bindings("CUSTOMDEPTH", g_runtime_depth_srv, g_runtime_depth_srv);
-    log_info("NFSTweakBridge: Bound Vulkan depth buffer as CUSTOMDEPTH.\n");
+    bind_runtime_depth_view(g_runtime_depth_srv);
+    log_info("NFSTweakBridge: Bound Vulkan depth buffer as NFSTWEAK_DEPTH.\n");
     g_vulkan_depth_last_score = g_vulkan_depth_candidate_score;
 
     // Reset candidate each frame so we don't stick to a stale/mismatched camera depth buffer.
@@ -448,15 +550,8 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         }
     }
 
-    const uint64_t req_frame_now = g_request_pre_hud_frame.load(std::memory_order_relaxed);
-    if (g_request_pre_hud_effects.load(std::memory_order_relaxed) &&
-        req_frame_now != 0 &&
-        frame > req_frame_now &&
-        (frame - req_frame_now) > 1)
-    {
-        // Keep request alive for one additional frame to avoid intermittent frame drops.
-        g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
-    }
+    // Keep request sticky while token window/epoch are valid.
+    // Expiry here causes visible every-N-frame preHUD drops when token timing jitters.
     bool wants_prehud = g_request_pre_hud_effects.load(std::memory_order_relaxed);
     if (wants_prehud)
     {
@@ -507,11 +602,14 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
 
     // Request timing from bridge often lands right before the first scene pass candidate.
     // Defer one qualifying pass so render happens on the subsequent scene pass in the same frame.
+    const bool bootstrap_no_lock =
+        g_prehud_locked_rt_resource.handle == 0 &&
+        g_prehud_locked_ds_resource.handle == 0;
     if (wants_prehud &&
+        bootstrap_no_lock &&
         prehud_rtv.handle != 0 &&
         prehud_dsv_resource.handle != 0 &&
-        exact_backbuffer_pass &&
-        score >= 1000 &&
+        scene_signature_candidate &&
         g_defer_first_qualifying_pass_after_request.exchange(false, std::memory_order_relaxed))
     {
         try_bind_vulkan_depth(ds->view, score);
@@ -519,19 +617,25 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
     }
     const uint64_t req_bp_for_render = g_request_pre_hud_beginpass.load(std::memory_order_relaxed);
     const uint64_t req_frame_for_render = g_request_pre_hud_frame.load(std::memory_order_relaxed);
+    const uint32_t phase_epoch = g_phase_epoch.load(std::memory_order_relaxed);
+    const uint32_t request_epoch = g_request_pre_hud_epoch.load(std::memory_order_relaxed);
+    const uint32_t window_epoch = g_scene_window_epoch.load(std::memory_order_relaxed);
+    constexpr uint64_t kRequestFrameWindow = 6;
+    constexpr uint64_t kRequestBeginpassWindow = 256;
     const bool request_frame_fresh =
         (req_frame_for_render != 0) &&
         (frame >= req_frame_for_render) &&
-        ((frame - req_frame_for_render) <= 1);
+        ((frame - req_frame_for_render) <= kRequestFrameWindow);
     const bool request_in_tight_window =
         (req_bp_for_render != 0) &&
         (bp > req_bp_for_render) &&
-        ((bp - req_bp_for_render) <= 48);
+        ((bp - req_bp_for_render) <= kRequestBeginpassWindow);
 
     const uint64_t last_render_bp = g_last_manual_render_beginpass.load(std::memory_order_relaxed);
     const bool render_cooldown_ok = (last_render_bp == 0) || (bp > last_render_bp && (bp - last_render_bp) >= 1);
     const uint64_t last_manual_frame = g_last_manual_prehud_frame.load(std::memory_order_relaxed);
     const bool not_rendered_this_frame = (last_manual_frame != frame);
+    const bool manual_latch_free = g_manual_render_latch_frame.load(std::memory_order_relaxed) != frame;
     // Keep soft lock stable across transient depth rebinds (rain/overbright/motion blur).
     // Clear happens only via explicit transition reset paths.
     const bool soft_lock_alive = false;
@@ -543,7 +647,10 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         close_pending && close_token == token && token != 0 && frame == close_frame;
     const bool token_window_open =
         (g_scene_window_open.load(std::memory_order_relaxed) || token_grace_open) && token != 0;
-    const bool token_not_rendered = token != 0 && g_scene_window_rendered_token.load(std::memory_order_relaxed) != token;
+    const bool epoch_match = (request_epoch == phase_epoch) && (window_epoch == phase_epoch);
+    // Per-frame guard already prevents duplicates. Do not require a fresh token each frame,
+    // because bridge token timing can jitter around present and cause intermittent skips.
+    const bool token_not_rendered = true;
     const bool locked_pair_pass =
         g_prehud_locked_rt_resource.handle != 0 &&
         g_prehud_locked_ds_resource.handle != 0 &&
@@ -572,15 +679,34 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
     const int bp_tol = std::max(1, g_prehud_bp_tolerance.load(std::memory_order_relaxed));
     const int bp_delta = (bp_bucket >= 0) ? (bp_in_frame - bp_bucket) : 0;
     const bool bp_bucket_match = (bp_bucket < 0) ? (bp_in_frame >= 1 && bp_in_frame <= 18) : (std::abs(bp_delta) <= bp_tol);
-    const int bp_bucket_miss = g_prehud_bp_bucket_miss.load(std::memory_order_relaxed);
-    const bool bp_bucket_relaxed = (bp_bucket >= 0) && (bp_bucket_miss >= 8);
-    const bool bp_bucket_gate_pass = true;
     const bool has_locked_pair =
         g_prehud_locked_rt_resource.handle != 0 &&
         g_prehud_locked_ds_resource.handle != 0;
+    const int bp_bucket_miss = g_prehud_bp_bucket_miss.load(std::memory_order_relaxed);
+    const bool bp_bucket_relaxed = (bp_bucket >= 0) && (bp_bucket_miss >= 10);
+    // Once lock exists, gate rendering to the stable beginpass slot to avoid pass-jitter flicker.
+    // Allow automatic relaxation after repeated misses so transitions can recover.
+    const bool bp_bucket_gate_pass = true;
+    const bool timing_gate_pass = true;
     const bool render_target_allowed =
         has_locked_pair ? locked_pair_pass : (exact_backbuffer_pass || bootstrap_render_allowed);
+    // DXVK occasionally emits beginpasses with null RT while DSV remains valid during transitions.
+    // Do not treat those as pre-HUD failures: skip quietly and wait for the next valid RT pass.
+    if (has_locked_pair &&
+        prehud_rtv.handle == 0 &&
+        prehud_dsv_resource.handle != 0 &&
+        g_prehud_locked_ds_resource.handle != 0 &&
+        prehud_dsv_resource.handle == g_prehud_locked_ds_resource.handle)
+    {
+        try_bind_vulkan_depth(ds->view, score);
+        return;
+    }
     if (!token_window_open && wants_prehud)
+    {
+        g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
+        wants_prehud = false;
+    }
+    if (!epoch_match && wants_prehud)
     {
         g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
         wants_prehud = false;
@@ -613,12 +739,12 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         score >= min_score_beginpass &&
         wants_prehud &&
         token_window_open &&
+        epoch_match &&
         token_not_rendered &&
-        request_frame_fresh &&
-        request_in_tight_window &&
-        bp_bucket_gate_pass &&
+        timing_gate_pass &&
         render_cooldown_ok &&
         not_rendered_this_frame &&
+        manual_latch_free &&
         !g_pre_hud_effects_issued_this_frame.load(std::memory_order_relaxed) &&
         g_skip_manual_prehud_frames.load() <= 0 &&
         !g_running_manual_effects.exchange(true))
@@ -657,8 +783,21 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         const uint64_t rc = g_render_counter.fetch_add(1, std::memory_order_relaxed) + 1;
         g_last_manual_render_beginpass.store(bp, std::memory_order_relaxed);
         g_running_manual_effects.store(false);
+        g_manual_render_latch_frame.store(frame, std::memory_order_relaxed);
         g_pre_hud_effects_issued_this_frame.store(true, std::memory_order_relaxed);
-        g_request_pre_hud_effects.store(false);
+        g_diag_last_prehud_rtv.store(static_cast<uint64_t>(prehud_rtv_resource.handle), std::memory_order_relaxed);
+        g_diag_last_prehud_dsv.store(static_cast<uint64_t>(prehud_dsv_resource.handle), std::memory_order_relaxed);
+        // Keep request armed; token/epoch/window logic will naturally disarm on phase transitions.
+        if (g_null_rtv_burst_last_frame.load(std::memory_order_relaxed) != 0 &&
+            frame > g_null_rtv_burst_last_frame.load(std::memory_order_relaxed) + 16)
+            g_null_rtv_burst_count.store(0, std::memory_order_relaxed);
+        // Keep rendering aligned to the same beginpass-in-frame slot to avoid pass jitter flicker.
+        if (bp_bucket < 0 || (!bp_bucket_match && bp_bucket_relaxed))
+            g_prehud_bp_bucket.store(bp_in_frame, std::memory_order_relaxed);
+        prehud_trace_push(1, frame, bp,
+            static_cast<uint64_t>(prehud_rtv_resource.handle),
+            static_cast<uint64_t>(prehud_dsv_resource.handle),
+            score, token, 0);
         g_scene_window_rendered_token.store(token, std::memory_order_relaxed);
         g_scene_window_open.store(false, std::memory_order_relaxed);
         g_scene_window_close_pending.store(false, std::memory_order_relaxed);
@@ -666,7 +805,8 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
         g_scene_window_close_frame.store(0, std::memory_order_relaxed);
         g_manual_prehud_primed.store(true, std::memory_order_relaxed);
         g_last_manual_prehud_frame.store(frame, std::memory_order_relaxed);
-        g_prehud_bp_bucket_miss.store(0, std::memory_order_relaxed);
+        if (bp_bucket_gate_pass)
+            g_prehud_bp_bucket_miss.store(0, std::memory_order_relaxed);
         // Lock selected pre-HUD pair once a render succeeds (exact-backbuffer preferred,
         // bootstrap accepted as fallback to avoid startup starvation).
         if (exact_backbuffer_pass || bootstrap_render_allowed)
@@ -679,10 +819,10 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             g_require_exact_backbuffer_lock.store(false, std::memory_order_relaxed);
             // Freeze to locked pair for a startup/transition window to avoid pass drift flicker.
             g_prehud_lock_freeze_until_frame.store(frame + 360, std::memory_order_relaxed);
-            // Freeze CUSTOMDEPTH source selection to this stable phase.
+            // Freeze runtime depth source selection to this stable phase.
             g_lock_vulkan_depth.store(true, std::memory_order_relaxed);
         }
-        if (rc <= 5 || (rc % 120) == 0)
+        if (rc <= 3 || (rc % 600) == 0)
         {
             char msg[320] = {};
             sprintf_s(msg,
@@ -698,21 +838,60 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
     }
     else if (wants_prehud)
     {
+        if (!bp_bucket_gate_pass && bp_bucket >= 0)
+            g_prehud_bp_bucket_miss.fetch_add(1, std::memory_order_relaxed);
         uint32_t reason = 0;
         if (!render_target_allowed) reason |= 0x01;
         if (score < min_score_beginpass) reason |= 0x02;
         if (!token_window_open) reason |= 0x04;
+        if (!epoch_match) reason |= 0x4000;
         if (!token_not_rendered) reason |= 0x08;
-        if (!request_frame_fresh) reason |= 0x100;
-        if (!request_in_tight_window) reason |= 0x10;
+        if (!timing_gate_pass)
+        {
+            if (!request_frame_fresh) reason |= 0x100;
+            if (!request_in_tight_window) reason |= 0x10;
+        }
         if (!allow_beginpass_render) reason |= 0x200;
         if (frame < g_manual_render_ready_frame.load(std::memory_order_relaxed)) reason |= 0x400;
         if (!render_cooldown_ok || !not_rendered_this_frame) reason |= 0x20;
+        if (!manual_latch_free) reason |= 0x80;
         if (g_pre_hud_effects_issued_this_frame.load(std::memory_order_relaxed) || g_skip_manual_prehud_frames.load() > 0 || g_running_manual_effects.load(std::memory_order_relaxed)) reason |= 0x40;
+        if (prehud_rtv.handle == 0 || prehud_rtv_resource.handle == 0) reason |= 0x800;
+        if (prehud_dsv_resource.handle == 0) reason |= 0x1000;
+        if (!bp_bucket_gate_pass && !(has_locked_pair && locked_pair_pass)) reason |= 0x2000;
+        if (reason == 0) reason = 0x80000000u;
+        // Vulkan path stays manual-only: do not arm regular post-HUD fallback,
+        // since that creates visible simultaneous/double application.
+
+        // Keep requests alive through one-off transient passes instead of dropping visible effects:
+        // - reason 0x03: no candidate RT/score (often short rtv=0 windows during transitions)
+        // Do not rebase on 0x40 contention, since that can cause intra-frame retry thrash/flicker.
+        if ((reason & 0x03) == 0x03 && prehud_rtv_resource.handle != 0)
+        {
+            g_request_pre_hud_frame.store(frame, std::memory_order_relaxed);
+            g_request_pre_hud_beginpass.store(bp, std::memory_order_relaxed);
+        }
+        // Also keep request alive when RT is transiently null but DS is valid (common on impact/post FX transitions).
+        // This avoids losing preHUD lock and falling back to post-HUD for those short windows.
+        if ((reason & 0x800) != 0 && prehud_dsv_resource.handle != 0)
+        {
+            g_request_pre_hud_frame.store(frame, std::memory_order_relaxed);
+            g_request_pre_hud_beginpass.store(bp, std::memory_order_relaxed);
+
+            // Keep request armed across transient null-RT passes; otherwise this creates
+            // frame-to-frame oscillation (flicker) until a new token lands.
+            g_defer_first_qualifying_pass_after_request.store(true, std::memory_order_relaxed);
+        }
+        prehud_trace_push(2, frame, bp,
+            static_cast<uint64_t>(prehud_rtv_resource.handle),
+            static_cast<uint64_t>(prehud_dsv_resource.handle),
+            score, token, reason);
+
+        // Auto trace dumping is disabled in runtime builds: too expensive during transitions.
 
         static uint64_t s_skip_diag_counter = 0;
         const uint64_t c = ++s_skip_diag_counter;
-        if (c <= 12 || (c % 180) == 0)
+        if (c <= 4 || (c % 2400) == 0)
         {
             char msg[320] = {};
             sprintf_s(msg,
@@ -735,7 +914,7 @@ static void on_begin_render_pass(command_list *cmd_list, uint32_t count, const r
             (s_last_rt != cur_rt || s_last_ds != cur_ds))
         {
             const uint64_t n = ++s_switch_log_counter;
-            if (n <= 10 || (n % 600) == 0)
+            if (n <= 4 || (n % 2400) == 0)
             {
                 char msg[320] = {};
                 sprintf_s(msg,
@@ -1240,7 +1419,7 @@ static void ProcessPendingDepth()
 
 
     // After a successful copy, bind the resource for shaders:
-    // runtime->update_texture_bindings("CUSTOMDEPTH", g_custom_depth_view, g_custom_depth_view);
+    // runtime depth is published via bind_runtime_depth_view().
     // NOTE: Must call update_texture_bindings *after* you have created resource views for g_custom_depth.
 }
 
@@ -1279,8 +1458,12 @@ static void on_overlay_ui(effect_runtime *runtime)
     if (g_device_api == device_api::vulkan)
     {
         bool vk_bind = g_enable_vulkan_depth_bind.load();
-        if (ImGui::Checkbox("Enable Vulkan Depth Bind (CUSTOMDEPTH)", &vk_bind))
+        if (ImGui::Checkbox("Enable Vulkan Depth Bind (NFSTWEAK_DEPTH)", &vk_bind))
             g_enable_vulkan_depth_bind.store(vk_bind);
+
+        bool debug_mirror = g_mirror_customdepth_debug.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("Debug mirror to CUSTOMDEPTH (ShowCustomDepth.fx)", &debug_mirror))
+            g_mirror_customdepth_debug.store(debug_mirror, std::memory_order_relaxed);
 
         bool vk_bp = g_enable_vulkan_beginpass_prehud.load();
         if (ImGui::Checkbox("Vulkan: BeginPass Pre-HUD (Experimental)", &vk_bp))
@@ -1351,7 +1534,8 @@ static void on_reshade_begin_effects(effect_runtime *runtime, command_list *cmd_
     const bool stabilizing =
         static_cast<prehud_runtime_state>(g_prehud_runtime_state.load(std::memory_order_relaxed)) ==
         prehud_runtime_state::stabilizing;
-    const bool block_regular_pass = enforce_manual_only || suppress || stabilizing;
+    const bool allow_fallback_this_begin = false;
+    const bool block_regular_pass = (enforce_manual_only || suppress || stabilizing) && !allow_fallback_this_begin;
     g_block_current_reshade_effects_pass.store(block_regular_pass && !manual, std::memory_order_relaxed);
 
     if (g_device_api == device_api::vulkan)
@@ -1361,7 +1545,7 @@ static void on_reshade_begin_effects(effect_runtime *runtime, command_list *cmd_
         if (manual)
         {
             ++s_manual_begin;
-            if (s_manual_begin <= 5 || (s_manual_begin % 240) == 0)
+            if (s_manual_begin <= 2 || (s_manual_begin % 1200) == 0)
             {
                 char msg[192] = {};
                 sprintf_s(msg, "NFSTweakBridge: begin_effects manual=%llu frame=%llu\n",
@@ -1372,13 +1556,17 @@ static void on_reshade_begin_effects(effect_runtime *runtime, command_list *cmd_
         }
         else
         {
+            g_diag_nonmanual_begin_this_frame.fetch_add(1, std::memory_order_relaxed);
+            if (g_block_current_reshade_effects_pass.load(std::memory_order_relaxed))
+                g_diag_nonmanual_blocked_this_frame.fetch_add(1, std::memory_order_relaxed);
             ++s_nonmanual_begin;
-            if (s_nonmanual_begin <= 10 || (s_nonmanual_begin % 600) == 0)
+            if (s_nonmanual_begin <= 4 || (s_nonmanual_begin % 2400) == 0)
             {
                 char msg[224] = {};
-                sprintf_s(msg, "NFSTweakBridge: begin_effects non-manual=%llu blocked=%d frame=%llu\n",
+                sprintf_s(msg, "NFSTweakBridge: begin_effects non-manual=%llu blocked=%d fallback=%d frame=%llu\n",
                     static_cast<unsigned long long>(s_nonmanual_begin),
                     g_block_current_reshade_effects_pass.load(std::memory_order_relaxed) ? 1 : 0,
+                    allow_fallback_this_begin ? 1 : 0,
                     static_cast<unsigned long long>(frame));
                 log_info(msg);
             }
@@ -1415,6 +1603,8 @@ static bool on_draw_or_dispatch_indirect_block_effects(command_list *, indirect_
 static void on_init_effect_runtime(effect_runtime *runtime)
 {
     g_runtime_alive.store(false, std::memory_order_relaxed);
+    g_allow_posthud_fallback_once.store(false, std::memory_order_relaxed);
+    g_manual_render_latch_frame.store(0, std::memory_order_relaxed);
     g_runtime = runtime;
     g_device = runtime->get_device();
     g_device_api = g_device ? g_device->get_api() : device_api::d3d9;
@@ -1432,12 +1622,13 @@ static void on_init_effect_runtime(effect_runtime *runtime)
         g_auto_pre_hud_effects.store(true);
         g_suppress_regular_post_hud_pass.store(true);
         g_enable_vulkan_depth_bind.store(true);
+        g_mirror_customdepth_debug.store(false, std::memory_order_relaxed);
         g_require_vulkan_backbuffer_rt.store(false);
         g_lock_vulkan_depth.store(false);
         g_require_vulkan_backbuffer_match.store(false);
         g_enable_vulkan_msaa_resolve.store(false);
         g_enable_vulkan_beginpass_prehud.store(false);
-        reset_prehud_transition("NFSTweakBridge: Initial runtime settle before pre-HUD activation.\n", 30);
+        reset_prehud_transition("NFSTweakBridge: Initial runtime settle before pre-HUD activation.\n", 60);
         log_info("NFSTweakBridge: Vulkan runtime detected (DXVK). Using Vulkan bind hook.\n");
         return;
     }
@@ -1446,14 +1637,14 @@ static void on_init_effect_runtime(effect_runtime *runtime)
     g_prehud_runtime_state.store(static_cast<int>(prehud_runtime_state::disabled), std::memory_order_relaxed);
 
     // Create a 1x1 placeholder and bind it immediately so effects compiling early
-    // do not force ReShade to create its own placeholder for the CUSTOMDEPTH semantic.
+    // do not force ReShade to create its own placeholder for the runtime depth semantic.
     g_width = 0;
     g_height = 0;
     if (create_or_resize_depth_resource(g_device, 1, 1, g_custom_depth, g_custom_depth_view, g_custom_depth_view_srgb))
     {
         g_width = 1;
         g_height = 1;
-        g_runtime->update_texture_bindings("CUSTOMDEPTH", g_custom_depth_view, g_custom_depth_view);
+        bind_runtime_depth_view(g_custom_depth_view);
     }
 
 }
@@ -1462,6 +1653,8 @@ static void on_destroy_effect_runtime(effect_runtime *runtime)
 {
     (void)runtime;
     g_runtime_alive.store(false, std::memory_order_relaxed);
+    g_allow_posthud_fallback_once.store(false, std::memory_order_relaxed);
+    g_manual_render_latch_frame.store(0, std::memory_order_relaxed);
     g_manual_effects_budget.store(0, std::memory_order_relaxed);
     g_manual_effects_cmdlist.store(0, std::memory_order_relaxed);
     g_manual_effects_frame.store(0, std::memory_order_relaxed);
@@ -1524,8 +1717,50 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
 
     const uint64_t frame = g_frame_index.fetch_add(1, std::memory_order_relaxed) + 1;
     g_frame_beginpass_start.store(g_beginpass_counter.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    const bool manual_rendered_prev = g_pre_hud_effects_issued_this_frame.load(std::memory_order_relaxed);
+    const uint32_t nonmanual_begin_prev = g_diag_nonmanual_begin_this_frame.load(std::memory_order_relaxed);
+    const uint32_t nonmanual_blocked_prev = g_diag_nonmanual_blocked_this_frame.load(std::memory_order_relaxed);
+    const uint64_t diag_rtv = g_diag_last_prehud_rtv.load(std::memory_order_relaxed);
+    const uint64_t diag_dsv = g_diag_last_prehud_dsv.load(std::memory_order_relaxed);
+    // Throttle frame diagnostics: emit on meaningful transitions or a sparse heartbeat.
+    static bool s_diag_prev_valid = false;
+    static bool s_diag_prev_manual = false;
+    static uint32_t s_diag_prev_nonmanual = 0;
+    static uint32_t s_diag_prev_blocked = 0;
+    static uint64_t s_diag_prev_rtv = 0;
+    static uint64_t s_diag_prev_dsv = 0;
+    const bool diag_changed =
+        !s_diag_prev_valid ||
+        (manual_rendered_prev != s_diag_prev_manual) ||
+        (nonmanual_begin_prev != s_diag_prev_nonmanual) ||
+        (nonmanual_blocked_prev != s_diag_prev_blocked) ||
+        (diag_rtv != s_diag_prev_rtv) ||
+        (diag_dsv != s_diag_prev_dsv);
+    const bool diag_heartbeat = ((frame % 240ull) == 0ull);
+    if (diag_changed || diag_heartbeat)
+    {
+        char diag[256] = {};
+        sprintf_s(diag,
+            "NFSTweakBridge: FrameDiag frame=%llu manual=%d nonmanual=%u blocked=%u rtv=%llu dsv=%llu\n",
+            static_cast<unsigned long long>(frame),
+            manual_rendered_prev ? 1 : 0,
+            nonmanual_begin_prev,
+            nonmanual_blocked_prev,
+            static_cast<unsigned long long>(diag_rtv),
+            static_cast<unsigned long long>(diag_dsv));
+        log_info(diag);
+    }
+    s_diag_prev_valid = true;
+    s_diag_prev_manual = manual_rendered_prev;
+    s_diag_prev_nonmanual = nonmanual_begin_prev;
+    s_diag_prev_blocked = nonmanual_blocked_prev;
+    s_diag_prev_rtv = diag_rtv;
+    s_diag_prev_dsv = diag_dsv;
     // New frame: allow one manual pre-HUD effect pass again.
     g_pre_hud_effects_issued_this_frame.store(false);
+    g_diag_nonmanual_begin_this_frame.store(0, std::memory_order_relaxed);
+    g_diag_nonmanual_blocked_this_frame.store(0, std::memory_order_relaxed);
+    g_allow_posthud_fallback_once.store(false, std::memory_order_relaxed);
     if (g_skip_manual_prehud_frames.load() > 0)
         g_skip_manual_prehud_frames.fetch_sub(1);
 
@@ -1538,7 +1773,7 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
         const uint64_t cf = g_scene_window_close_frame.load(std::memory_order_relaxed);
         // Keep token window alive for a few frames after close signal.
         // FE/weather/overlay transitions can delay the qualifying Vulkan pass.
-        constexpr uint64_t k_close_grace_frames = 3;
+        constexpr uint64_t k_close_grace_frames = 12;
         if (frame > (cf + k_close_grace_frames))
         {
             g_scene_window_open.store(false, std::memory_order_relaxed);
@@ -1558,17 +1793,33 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
     }
     prev_f9 = cur_f9;
 
+    static bool prev_f10_down = false;
+    const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    const bool ctrl_down = ((GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0) || ((GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0);
+    if (f10_down && !prev_f10_down && ctrl_down)
+    {
+        log_info("NFSTweakBridge: Ctrl+F10 -> dumping preHUD trace.\n");
+        prehud_trace_dump(256);
+    }
+    prev_f10_down = f10_down;
+
     // Vulkan path: choose/bind once per frame (reduces flicker and avoids partial binds).
     if (g_device_api == device_api::vulkan)
     {
         if (g_phase_invalidate_pending.exchange(false, std::memory_order_relaxed))
         {
             const uint32_t reason = g_phase_invalidate_reason.load(std::memory_order_relaxed);
+            const uint32_t requested_epoch = g_phase_invalidate_epoch.load(std::memory_order_relaxed);
+            const uint32_t prev_epoch = g_phase_epoch.load(std::memory_order_relaxed);
+            uint32_t next_epoch = (requested_epoch != 0) ? requested_epoch : (prev_epoch + 1);
+            if (next_epoch <= prev_epoch)
+                next_epoch = prev_epoch + 1;
+            g_phase_epoch.store(next_epoch, std::memory_order_relaxed);
             reset_prehud_transition(nullptr, 20, true);
             if (reason == 1u || reason == 2u)
                 g_require_exact_backbuffer_lock.store(false, std::memory_order_relaxed);
-            char msg[192] = {};
-            sprintf_s(msg, "NFSTweakBridge: Bridge phase invalidate; re-stabilizing pre-HUD lock (reason=%u).\n", reason);
+            char msg[224] = {};
+            sprintf_s(msg, "NFSTweakBridge: Bridge phase invalidate; re-stabilizing pre-HUD lock (reason=%u epoch=%u->%u).\n", reason, prev_epoch, next_epoch);
             log_info(msg);
         }
 
@@ -1577,6 +1828,18 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
             const uint32_t value = g_precip_signal_value.load(std::memory_order_relaxed);
             const uint32_t last = g_last_precip_signal_value.load(std::memory_order_relaxed);
             const uint64_t last_frame = g_last_precip_signal_frame.load(std::memory_order_relaxed);
+            if (last == 0xFFFFFFFFu)
+            {
+                // Bootstrap baseline only: first observed precipitation state at startup should
+                // not force a transition/reset, since that causes early-frame instability/flicker.
+                g_last_precip_signal_value.store(value, std::memory_order_relaxed);
+                g_last_precip_signal_frame.store(frame, std::memory_order_relaxed);
+                char msg[192] = {};
+                sprintf_s(msg, "NFSTweakBridge: Bridge precipitation baseline captured (sig=0x%X).\n", value);
+                log_info(msg);
+            }
+            else
+            {
             constexpr uint64_t k_rearm_cooldown_frames = 180;
             const bool changed = (value != last);
             const bool cooldown_ok =
@@ -1586,9 +1849,9 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
                 const bool precip_on = (value != 0);
                 // Preserve current lock through precipitation transitions to avoid effect dropouts.
                 // Full lock clear can select a transient rain RT and lead to "no effects" periods.
-                reset_prehud_transition(nullptr, precip_on ? 6 : 4, false);
+                reset_prehud_transition(nullptr, precip_on ? 2 : 2, false);
                 g_skip_manual_prehud_frames.store(0, std::memory_order_relaxed);
-                g_manual_render_ready_frame.store(frame + 1, std::memory_order_relaxed);
+                g_manual_render_ready_frame.store(frame, std::memory_order_relaxed);
                 g_last_precip_signal_value.store(value, std::memory_order_relaxed);
                 g_last_precip_signal_frame.store(frame, std::memory_order_relaxed);
 
@@ -1596,6 +1859,11 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
                 sprintf_s(msg, "NFSTweakBridge: Bridge precipitation %s; re-stabilizing pre-HUD lock (sig=0x%X).\n",
                     precip_on ? "ON" : "OFF", value);
                 log_info(msg);
+                prehud_trace_push(3, frame, g_beginpass_counter.load(std::memory_order_relaxed),
+                    static_cast<uint64_t>(g_prehud_locked_rt_resource.handle),
+                    static_cast<uint64_t>(g_prehud_locked_ds_resource.handle),
+                    0u, g_scene_window_token.load(std::memory_order_relaxed), value);
+            }
             }
         }
 
@@ -1607,7 +1875,6 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
             if (settle > 0)
             {
                 g_transition_settle_frames.fetch_sub(1, std::memory_order_relaxed);
-                g_request_pre_hud_effects.store(false, std::memory_order_relaxed);
             }
             else
             {
@@ -1620,6 +1887,17 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
         // This avoids double-request churn and pass racing when the ASI bridge is active.
         const uint64_t last_bridge_req = g_last_bridge_request_frame.load(std::memory_order_relaxed);
         const bool bridge_feed_alive = (last_bridge_req != 0) && ((frame - last_bridge_req) <= 2);
+        const bool token_window_open_now =
+            g_scene_window_open.load(std::memory_order_relaxed) &&
+            g_scene_window_token.load(std::memory_order_relaxed) != 0 &&
+            g_scene_window_epoch.load(std::memory_order_relaxed) == g_phase_epoch.load(std::memory_order_relaxed);
+        if (state == prehud_runtime_state::active && token_window_open_now)
+        {
+            // Keep request armed while bridge token window is open.
+            // This removes frame-to-frame request gaps that show up as visible flicker.
+            g_request_pre_hud_effects.store(true, std::memory_order_relaxed);
+            g_request_pre_hud_epoch.store(g_phase_epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
         if (state == prehud_runtime_state::active &&
             g_auto_pre_hud_effects.load(std::memory_order_relaxed) &&
             !bridge_feed_alive)
@@ -1640,11 +1918,10 @@ static void on_present(command_queue*, swapchain*, const rect*, const rect*, uin
 
     ProcessPendingDepth();
 
-    // If resource was successfully copied, bind it to a semantic so FX can use it:
+    // If resource was successfully copied, bind it to runtime depth semantic for FX use:
     if (g_runtime && g_custom_depth_view.handle)
     {
-        // Make sure the semantic string matches the one used in your FX (e.g. "CUSTOMDEPTH")
-        g_runtime->update_texture_bindings("CUSTOMDEPTH", g_custom_depth_view, g_custom_depth_view);
+        bind_runtime_depth_view(g_custom_depth_view);
     }
 }
 

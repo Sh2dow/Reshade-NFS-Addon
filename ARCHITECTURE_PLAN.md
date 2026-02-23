@@ -70,8 +70,26 @@ No per-pass spam.
   - `NFS_addon/src/addon_dllmain.inl`
 - `NFS_addon/dllmain.cpp` is now a thin entry include file.
 
-## Next Implementation Steps
-1. Add explicit overlay enter/exit signal in bridge and remove FE polling from add-on runtime decisions.
-2. Introduce `epoch` and enforce epoch match in token/render path.
-3. Replace remaining fallback locks with state-machine lock acquisition only.
-4. Reduce logs to transition-only diagnostics.
+## Implementation Phases
+### Phase 1 (in progress)
+1. Keep bridge as producer-only timing source.
+2. Add epoch-aware contract:
+   - `NFSTweak_BeginPreHudWindowEx(token, epoch)`
+   - `NFSTweak_EndPreHudWindowEx(token, epoch)`
+   - `NFSTweak_NotifyPhaseInvalidateEx(reason, epoch)`
+3. Keep legacy exports for compatibility:
+   - `NFSTweak_BeginPreHudWindow(token)`
+   - `NFSTweak_EndPreHudWindow(token)`
+   - `NFSTweak_NotifyPhaseInvalidate(reason)`
+4. Add-on render gating requires epoch match:
+   - request epoch == current phase epoch
+   - token window epoch == current phase epoch
+
+### Phase 2
+1. Remove pass-bucket/tight-window heuristics from lock state machine.
+2. Acquire lock only via exact-backbuffer or deterministic repeated candidate in same epoch.
+3. Keep render as strict single-pass-per-token.
+
+### Phase 3
+1. Reduce runtime logs to transition-only.
+2. Keep optional high-detail diagnostics behind explicit toggle/hotkey.
